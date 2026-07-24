@@ -8,6 +8,14 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com).
 
 ---
 
+## [v0.7.0] — 2026-07-24
+
+### Changed
+- **Disabled plugins now actually stop running** (#225) — Turning a plugin off used to only hide it in the overlay while its backend kept running — so a "disabled" hardware plugin (TDP, fan, RGB, InputPlumber) could keep driving your device and clash with tools like Decky Loader if you ran both. The backend now never loads a disabled plugin's code at all: it isn't bundled, imported, or started, and its RPC and asset endpoints are closed off. Enabling a plugin loads it live with no restart; disabling one that's currently running surfaces a **"Restart required"** button in the footer status bar (plus a reminder when you toggle it off), because code that has already started can't be torn down in place.
+
+### Upgrade notes
+- Plugin enablement moved from an allow-list to a deny-list, migrated automatically on first launch and preserving exactly the set you had visible before. One consequence: a plugin that ships **new** in this release can land **disabled** for existing users — if a new plugin seems missing, enable it in **Settings → Plugins**. (New plugins default to enabled only after that one-time migration.)
+
 ## [v0.6.0] — 2026-07-21
 
 ### Added
