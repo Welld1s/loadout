@@ -8,6 +8,12 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com).
 
 ---
 
+## [v0.7.1] — 2026-07-24
+
+### Fixed
+- **Controller no longer goes "dead" in Steam after boot** (#226) — On InputPlumber-managed handhelds (e.g. the OneXPlayer APEX) a spurious wake could fire about a second into boot — before the Steam session was fully up — silently opening the overlay while it was still invisible. That grabbed the controller and routed it into the hidden overlay, so Steam looked unresponsive to the pad until you restarted InputPlumber. The overlay now ignores wake events that would *open* it during a short startup grace window, so a boot-time phantom press can't divert the controller; a press that *closes* the overlay is never suppressed.
+- **Battery charge limit reappears on the OneXPlayer APEX** (#227) — The charge-limit control had vanished from the Battery plugin (while bypass charging stayed), because the APEX's EC exposes `charge_control_end_threshold` as effectively write-only — it accepts writes but errors when read, and the plugin probed support by reading it. Support is now detected from the attribute's presence, and the slider falls back to your saved limit when the value can't be read back, so it shows the limit you actually applied instead of snapping to "no limit".
+
 ## [v0.7.0] — 2026-07-24
 
 ### Changed
