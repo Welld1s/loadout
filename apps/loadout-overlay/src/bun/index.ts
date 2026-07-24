@@ -51,7 +51,7 @@ import {
 
 import { trace } from "./native/trace";
 import { createOverlayState } from "./lib/overlay-state";
-import { routeWake } from "./lib/wake-routing";
+import { routeWake, isStartupWakePhantom } from "./lib/wake-routing";
 import { loadPersistedShortcuts } from "./lib/persisted-shortcuts";
 
 // ---- State ------------------------------------------------------------------
@@ -162,6 +162,15 @@ const webviewEverAlive: { current: boolean } = { current: false };
 // and to the close-path `intercept.current?.release()` inside
 // toggleOverlay.
 const intercept: { current: InputInterceptHandle | null } = { current: null };
+// Monotonic baseline for the startup phantom-wake guard (see onWake /
+// isStartupWakePhantom). Seeded at module load so the guard is armed even for
+// a wake that somehow arrives before the interceptors finish starting, then
+// RE-ANCHORED to the moment the evdev nodes actually open (the evdev
+// `onReady` below). The phantom F16 is observed ~1s after the nodes open, and
+// the async startup before that (persisted-config read + IP DBus discovery)
+// is variable — anchoring to node-open gives a deterministic 5s window that
+// matches the observed failure timing rather than eating into it.
+const inputStartedAt = { current: performance.now() };
 // InputPlumber intercept-mode path — runs alongside the evdev interceptor on
 // IP-managed handhelds (deck-uhid target, no grabbable evdev). On grab it sets
 // InterceptMode=2 so Steam BPM is starved and nav arrives over D-Bus; on hosts
@@ -560,6 +569,19 @@ function toggleOverlay(source: string) {
 // these were a hardcoded subset that ignored the config — Guide+X
 // did nothing despite defaulting to ToggleOverlay).
 function onWake(event: WakeEvent): void {
+  // Drop boot-time phantom wakes that would open the overlay before the
+  // graphical session is ready. On IP-managed handhelds the InputPlumber
+  // virtual keyboard sometimes emits a spurious F16 (→ QamToggle) ~1s into
+  // boot; acting on it opens the overlay invisibly and diverts the pad away
+  // from Steam (Steam looks dead until InputPlumber is restarted). See
+  // isStartupWakePhantom. Only opens are suppressed — a close always works.
+  const elapsed = performance.now() - inputStartedAt.current;
+  if (isStartupWakePhantom({ elapsedSinceStartMs: elapsed, isOpen: state.isOpen })) {
+    trace(
+      `[overlay] ignoring wake=${event} within startup grace (${Math.round(elapsed)}ms) — likely boot phantom`,
+    );
+    return;
+  }
   // The branch-table for "which wake event does what given the current
   // shortcut config" is pure — extracted into lib/wake-routing.ts so
   // the table is unit-tested without booting the full main process.
@@ -670,10 +692,16 @@ void (async () => {
         // main content area with its own rAF + momentum loop.
         sendToWebview("overlay-scroll", { axis, value });
       },
-      onReady: (c) =>
+      onReady: (c) => {
+        // Re-anchor the phantom-wake grace window to the moment the evdev
+        // nodes are open (see inputStartedAt). onReady fires synchronously
+        // after the devices are opened and before the read loop polls, so no
+        // wake can be observed before this reset.
+        inputStartedAt.current = performance.now();
         console.log(
           `[overlay] input intercept ready — ${c.controllers} controller(s), ${c.keyboards} keyboard(s), ${c.qam} qam device(s) (readVirtualPadsForNav=${readVirtualPadsForNav})`,
-        ),
+        );
+      },
     });
     intercept.current = handle;
   } catch (err) {
