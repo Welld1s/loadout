@@ -13,6 +13,7 @@ import { apiUrl, authHeaders } from "../lib/backend";
 import { useSidebarAutoCollapseSetting } from "../hooks/useSidebarCollapse";
 import { OVERLAY_VERSION } from "../version";
 import { useEnabledPlugins } from "../hooks/useEnabledPlugins";
+import { useInstalledPlugins } from "../hooks/usePlugins";
 import { useConfigValue, getConfigValue, setConfigValue } from "../lib/userConfig";
 import {
   getControllerShortcuts,
@@ -519,10 +520,13 @@ function SettingsInner({
   );
   const [shortcuts, setShortcuts] = useState<ControllerShortcuts | null>(null);
   const { isEnabled, toggle: togglePluginEnabled } = useEnabledPlugins();
-  const allPluginIds = useMemo(() => plugins.map((p) => p.id), [plugins]);
+  // Full on-disk plugin list incl. disabled ones (which the `plugins`
+  // prop — the loaded set used for shortcut targets — never contains),
+  // so the Plugins tab can list and re-enable them.
+  const { plugins: installedPlugins } = useInstalledPlugins();
   const sortedPlugins = useMemo(
-    () => [...plugins].sort((a, b) => a.name.localeCompare(b.name)),
-    [plugins],
+    () => [...installedPlugins].sort((a, b) => a.name.localeCompare(b.name)),
+    [installedPlugins],
   );
   const enabledCount = sortedPlugins.filter((p) => isEnabled(p.id)).length;
 
@@ -792,7 +796,20 @@ function SettingsInner({
                     <div className="shrink-0">
                       <Toggle
                         checked={on}
-                        onChange={() => togglePluginEnabled(plugin.id, allPluginIds)}
+                        onChange={() => {
+                          togglePluginEnabled(plugin.id);
+                          // Turning OFF a plugin the backend is running:
+                          // its code can't be unloaded in place, so it
+                          // keeps running until an app restart. Say so at
+                          // the moment of the action — the footer "Restart
+                          // required" button is the persistent affordance.
+                          if (on && plugin.status === "loaded") {
+                            notify(
+                              `${plugin.name} keeps running until you restart Loadout.`,
+                              { kind: "info", id: "plugin-disable", duration: 4000 },
+                            );
+                          }
+                        }}
                       />
                     </div>
                   </div>
