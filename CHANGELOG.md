@@ -8,6 +8,21 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com).
 
 ---
 
+## [v0.7.2] — 2026-07-29
+
+### Fixed
+- **The overlay now captures the controller on Steam Deck** (#228) — On the Deck the overlay opened but the pad kept driving whatever was behind it: Steam reads the built-in controller over **hidraw**, which the exclusive-grab mechanism used everywhere else simply cannot intercept. Worse, in Big Picture's home screen there was no controller for the overlay to read at all — Steam only exposes its virtual pad while a game is running — so the overlay opened with no navigation whatsoever. The overlay now decodes the Deck's controller directly from its own hidraw stream, takes over every built-in input node while it's open, and pauses Steam in game mode so nothing leaks through underneath. It works in Steam's menus with no game running, in-game, and on the desktop; external wireless pads keep working as before. Handhelds managed by InputPlumber (e.g. the OneXPlayer APEX) are unaffected.
+- **Your Max TDP is no longer silently overridden on battery** (#230, #233) — If you entered a custom device and raised its Max TDP, the slider could still stop far short — an 80 W maximum capping at ~30 W — with nothing on screen explaining why. The custom-device form was pre-filling **Battery max TDP** from whatever device was auto-detected, and that lower figure quietly won whenever you were unplugged. That field is now optional: leave it blank and your Max TDP applies on battery too. It only ever misbehaved on battery, which is why it looked intermittent.
+- **Per-game TDP profiles no longer cap at 80 W** (#233) — Saved per-game profiles were clamped to 80 W regardless of hardware, so owners of the OneXPlayer Super X (90 W) and GPD Win 5 (85 W) could not save a profile at their device's real ceiling. No custom device was needed to hit this.
+- **Plugin widgets and icons no longer come up blank after a boot** (#229) — On a handheld that boots straight into gaming mode, Wi-Fi often finishes connecting in the same instant the overlay loads its plugins. That reconnect cancelled whichever plugin downloads were still in flight, and nothing ever retried them — so an arbitrary set of plugins (Battery, Display, Bluetooth, Wi-Fi, Storage and others) showed empty widgets and letter placeholders instead of icons for the rest of the session, until the overlay was restarted by hand. Those downloads now retry, and a failed icon no longer sticks.
+
+### Changed
+- **TDP is capped at 55 W while running on battery**, on every device (#233). Sustained draw above that pushes a handheld's cells past what they're specified for. The limit applies only on battery — plugged in, your device's full range is available — and an informational note under the slider tells you when it's in effect, which you can dismiss. Devices whose own on-battery limit is already lower keep it: a Steam Deck stays at 15 W, an ROG Ally at 20 W.
+
+### Upgrade notes
+- **OneXPlayer Super X owners**: your on-battery ceiling drops from 65 W to 55 W. Plugged-in behaviour is unchanged.
+- If you previously entered a **custom device**, a one-time fix clears a battery limit that looks like it came from the old pre-filled form (it matched the auto-detected default and sat below your own Max TDP). It runs once — set a battery limit yourself afterwards and it will be kept.
+
 ## [v0.7.1] — 2026-07-24
 
 ### Fixed
