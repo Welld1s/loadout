@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EmitPayload } from "@loadout/types";
@@ -185,6 +185,23 @@ describe("TdpControlBackend", () => {
   // hardware write so we can assert the clamp math without /sys.
 
   describe("power-state limits", () => {
+    const acTempDirs: string[] = [];
+    afterEach(() => {
+      for (const d of acTempDirs.splice(0)) {
+        rmSync(d, { recursive: true, force: true });
+      }
+    });
+
+    /** A stand-in for /sys/class/power_supply/<supply>/online, so AC state in
+     *  these tests is ours and not the host's. */
+    function acFile(contents: "0" | "1"): string {
+      const dir = mkdtempSync(join(tmpdir(), "tdp-ac-"));
+      acTempDirs.push(dir);
+      const f = join(dir, "online");
+      writeFileSync(f, `${contents}\n`);
+      return f;
+    }
+
     function configure(opts: { ac: boolean | null }) {
       const b = backend as unknown as {
         method: string;
@@ -204,6 +221,66 @@ describe("TdpControlBackend", () => {
       b.setTdpViaRyzenadj = async () => {}; // stub the SMU write
       return b;
     }
+
+    it("resume preserves the standing intent, so plugging back in springs up", async () => {
+      // Regression: onResume used to re-apply trackedTdp (the CLAMPED figure)
+      // and applyTdp rewrites desiredTdp from what it is given — so an 80W
+      // intent collapsed to 55W permanently and never sprang back on AC.
+      const b = configure({ ac: true }) as unknown as {
+        desiredTdp: number | null;
+        currentTdp: number | null;
+        trackedTdp: number | null;
+        acPowerOnline: boolean | null;
+        acPowerPath: string | null;
+        setTdpViaRyzenadj: (w: number) => Promise<void>;
+      };
+      const applied: number[] = [];
+      b.setTdpViaRyzenadj = async (w: number) => {
+        applied.push(w);
+      };
+
+      await backend.setTdp(80);
+      expect(b.desiredTdp).toBe(80);
+
+      // Point AC state at a FILE we control, reading "0" (on battery).
+      // Setting acPowerPath = null instead would make refreshAcPower fall
+      // through to detectAcPower() and read the HOST's /sys — which passed on
+      // an unplugged dev machine and failed on CI, where no Mains node exists
+      // so acPowerOnline becomes null ("unknown AC") and nothing clamps.
+      // Tests must not depend on whether the machine running them is plugged in.
+      b.acPowerPath = acFile("0");
+      b.acPowerOnline = false;
+      // trackedTdp is what was last WRITTEN, i.e. already clamped — it must
+      // differ from the intent or this test can't tell the two apart.
+      b.trackedTdp = 55;
+      applied.length = 0;
+
+      await backend.onResume();
+
+      // Clamped for the write...
+      expect(applied).toEqual([55]);
+      // ...but the INTENT survives, so AC restores 80.
+      expect(b.desiredTdp).toBe(80);
+    });
+
+    it("resume writes the SMU once, not twice", async () => {
+      const b = configure({ ac: false }) as unknown as {
+        trackedTdp: number | null;
+        acPowerPath: string | null;
+        setTdpViaRyzenadj: (w: number) => Promise<void>;
+      };
+      const applied: number[] = [];
+      b.setTdpViaRyzenadj = async (w: number) => {
+        applied.push(w);
+      };
+      await backend.setTdp(40);
+      b.trackedTdp = 40;
+      b.acPowerPath = acFile("0");
+      applied.length = 0;
+
+      await backend.onResume();
+      expect(applied.length).toBe(1);
+    });
 
     it("applies the full value when plugged in", async () => {
       const b = configure({ ac: true });

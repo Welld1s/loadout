@@ -372,3 +372,64 @@ export function matchProfileName(
   }
   return "Custom";
 }
+
+/**
+ * Hard ceiling on TDP while running on battery, in watts — applies to EVERY
+ * device regardless of its `batteryMaxTdp` or any user override.
+ *
+ * Sustained high-wattage draw on a handheld's cells is the failure mode this
+ * guards: it drives cell temperature and discharge current well past what
+ * these packs are specified for, degrading capacity and, at the extreme,
+ * risking damage. No device's battery ceiling should exceed this, so it is
+ * enforced as a floor-of-last-resort rather than left to per-device data or
+ * to whatever a user types into the custom-device form.
+ *
+ * Applies ONLY on battery. Plugged in, the device's own `maxTdp` governs and
+ * this value is irrelevant.
+ */
+export const BATTERY_SAFE_MAX_WATTS = 55;
+
+/**
+ * The TDP ceiling that applies right now, given power state. Pure.
+ *
+ * `acOnline === false` means "known to be on battery" — an unknown/null AC
+ * state deliberately does NOT restrict, because misreporting AC as absent
+ * would throttle a plugged-in device for no reason.
+ */
+export function effectiveMaxWatts({
+  acOnline,
+  maxTdp,
+  batteryMaxTdp,
+}: {
+  acOnline: boolean | null;
+  maxTdp: number;
+  batteryMaxTdp: number;
+}): number {
+  if (acOnline !== false) return maxTdp;
+  return Math.min(batteryMaxTdp, BATTERY_SAFE_MAX_WATTS);
+}
+
+/**
+ * True when running on battery reduces the TDP ceiling at all — whether the
+ * cause is the device's own `batteryMaxTdp` or the global
+ * BATTERY_SAFE_MAX_WATTS. Drives the informational notice: a slider that
+ * stops short of the number the user set is confusing regardless of WHICH
+ * limit produced it, so the notice doesn't distinguish them.
+ *
+ * False when the on-battery ceiling equals the plugged one (e.g. Steam Deck
+ * at 15 W) — there is nothing to explain, and claiming the max "might be
+ * lower" would simply be wrong.
+ */
+export function isBatteryLimited({
+  acOnline,
+  maxTdp,
+  batteryMaxTdp,
+}: {
+  acOnline: boolean | null;
+  maxTdp: number;
+  batteryMaxTdp: number;
+}): boolean {
+  return (
+    effectiveMaxWatts({ acOnline, maxTdp, batteryMaxTdp }) < maxTdp
+  );
+}

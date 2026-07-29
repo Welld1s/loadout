@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { FaBolt, FaMicrochip, FaGear } from "react-icons/fa6";
+import { FaBolt, FaMicrochip, FaGear, FaBatteryHalf } from "react-icons/fa6";
 import {
   mountComponent,
   mountHeaderStub,
@@ -17,6 +17,7 @@ import {
   PluginHeader,
   HeaderBackButton,
   IconButton,
+  Alert,
 } from "@loadout/ui";
 import { steamArtworkUrls } from "@loadout/steam-paths/artwork";
 import type { CustomDevice } from "./lib/custom-device";
@@ -32,6 +33,10 @@ interface TdpInfo {
   pluggedMaxWatts: number;
   /** Ceiling when on battery (<= pluggedMaxWatts). */
   batteryMaxWatts: number;
+  /** Global on-battery ceiling applied to every device. */
+  batterySafeMaxWatts?: number;
+  /** True when being on battery lowers the ceiling right now. */
+  batteryLimited?: boolean;
   platform: string;
   deviceName: string;
   method: string;
@@ -88,6 +93,29 @@ function TdpControl() {
 
   const [info, setInfo] = useState<TdpInfo | null>(null);
   const [sliderValue, setSliderValue] = useState<number>(15);
+  /**
+   * Dismissal state for the on-battery TDP notice, holding the TOKEN that was
+   * dismissed rather than a plain boolean.
+   *
+   * Re-show policy — the notice comes back when any of these happen:
+   *  1. The ceilings change. The token is the ceiling pair, so unplugging
+   *     from a state with a different pair, or editing the device's limits,
+   *     mints a token no dismissal covers. Note a plug/unplug ROUND TRIP
+   *     restores the identical pair, so a dismissal survives it — deliberate:
+   *     nothing about the situation actually changed.
+   *  2. The user returns to the plugin. This is local state and tdp-control
+   *     isn't `keepAlive`, so navigating away unmounts and clears it.
+   *  3. The user drags the slider back up to the ceiling (see
+   *     handleSliderChange) — pressing against the limit is exactly when the
+   *     explanation is wanted again.
+   *
+   * What it deliberately does NOT do is reappear on every TDP change, which
+   * would be nagging: dismissing it while already at the ceiling keeps it
+   * hidden until one of the above actually occurs.
+   */
+  const [batteryNoticeDismissed, setBatteryNoticeDismissed] = useState<
+    string | null
+  >(null);
   const [error, setError] = useState<string | null>(null);
   const [applying, setApplying] = useState(false);
   const [perGameEnabled, setPerGameEnabled] = useState<boolean>(false);
@@ -136,9 +164,27 @@ function TdpControl() {
   useEvent({
     event: "acPowerChanged",
     handler: (data) => {
-      const { maxWatts } = data as { online: boolean; maxWatts: number };
+      const { maxWatts, pluggedMaxWatts, batteryLimited } = data as {
+        online: boolean;
+        maxWatts: number;
+        pluggedMaxWatts?: number;
+        batteryLimited?: boolean;
+      };
       if (typeof maxWatts === "number") {
-        setInfo((prev) => (prev ? { ...prev, maxWatts } : prev));
+        setInfo((prev) =>
+          prev
+            ? {
+                ...prev,
+                maxWatts,
+                ...(typeof pluggedMaxWatts === "number"
+                  ? { pluggedMaxWatts }
+                  : {}),
+                ...(typeof batteryLimited === "boolean"
+                  ? { batteryLimited }
+                  : {}),
+              }
+            : prev,
+        );
       }
     },
   });
@@ -152,6 +198,9 @@ function TdpControl() {
         deviceName: string;
         minWatts: number;
         maxWatts: number;
+        pluggedMaxWatts?: number;
+        batteryMaxWatts?: number;
+        batteryLimited?: boolean;
         profiles: Record<string, number>;
         usingCustomDevice: boolean;
       };
@@ -162,6 +211,18 @@ function TdpControl() {
               deviceName: d.deviceName,
               minWatts: d.minWatts,
               maxWatts: d.maxWatts,
+              // Keep the ceiling trio in lockstep with maxWatts. Updating one
+              // without the others is what made the notice claim a battery
+              // ceiling above the plugged one after a device edit.
+              ...(typeof d.pluggedMaxWatts === "number"
+                ? { pluggedMaxWatts: d.pluggedMaxWatts }
+                : {}),
+              ...(typeof d.batteryMaxWatts === "number"
+                ? { batteryMaxWatts: d.batteryMaxWatts }
+                : {}),
+              ...(typeof d.batteryLimited === "boolean"
+                ? { batteryLimited: d.batteryLimited }
+                : {}),
               profiles: d.profiles,
               usingCustomDevice: d.usingCustomDevice,
             }
@@ -249,10 +310,21 @@ function TdpControl() {
     [call],
   );
 
+  // Identifies the current on-battery situation. Changing ceilings (unplug,
+  // replug, device edit) yield a new token, which no prior dismissal covers.
+  const batteryNoticeToken = info
+    ? `${info.maxWatts}/${info.pluggedMaxWatts ?? info.maxWatts}`
+    : "";
+  const showBatteryNotice =
+    !!info?.batteryLimited && batteryNoticeDismissed !== batteryNoticeToken;
+
   const handleSliderChange = useCallback(
     (watts: number) => {
       setSliderValue(watts);
       slidingRef.current = true;
+      // Pushing the slider to the ceiling re-arms the notice: the user is
+      // asking for more than they can have right now, so tell them why.
+      if (info && watts >= info.maxWatts) setBatteryNoticeDismissed(null);
 
       // Debounce — only fire when user stops adjusting. When per-game is
       // on, the same release also persists the value: against the
@@ -276,7 +348,7 @@ function TdpControl() {
         }
       }, 500);
     },
-    [handleSetTdp, perGameEnabled, currentGame, call],
+    [handleSetTdp, perGameEnabled, currentGame, call, info],
   );
 
   const handleTogglePerGame = useCallback(
@@ -526,6 +598,20 @@ function TdpControl() {
                   <span>{Math.round(info.maxWatts / 2)}W</span>
                   <span>{info.maxWatts}W</span>
                 </div>
+                {/* Informational, not a warning: nothing is wrong, the range
+                    is simply narrower right now. Sits under the slider
+                    because that's the control it explains. */}
+                {showBatteryNotice && (
+                  <Alert
+                    variant="info"
+                    icon={<FaBatteryHalf size={16} />}
+                    className="mt-4 mb-0"
+                    onDismiss={() => setBatteryNoticeDismissed(batteryNoticeToken)}
+                    dismissLabel="Dismiss battery TDP notice"
+                  >
+                    {`On battery, so the maximum is ${info.maxWatts} W. Plug in for up to ${info.pluggedMaxWatts ?? info.maxWatts} W.`}
+                  </Alert>
+                )}
               </div>
             )}
           </div>
@@ -813,11 +899,13 @@ function CustomDeviceForm({ info }: { info: TdpInfo }) {
     // the battery cap from `batteryMaxWatts`. Fall back to `maxWatts` for
     // older backends that don't report the split ceilings.
     const trueMax = i.pluggedMaxWatts ?? i.maxWatts;
-    const batteryMax = i.batteryMaxWatts ?? i.maxWatts;
     setName(i.deviceName && i.deviceName !== "Unknown" ? i.deviceName : "");
     setMinTdp(String(i.minWatts));
     setMaxTdp(String(trueMax));
-    setBatteryMaxTdp(String(batteryMax));
+    // Deliberately NOT seeded from the detected device (issue #230): a
+    // pre-filled 28-30 W from some other device's profile silently capped the
+    // slider once the user raised Max TDP. Blank means "same as Max TDP".
+    setBatteryMaxTdp("");
     setSilent(String(i.profiles.Silent ?? i.minWatts));
     setBalanced(
       String(i.profiles.Balanced ?? Math.round((i.minWatts + trueMax) / 2)),
@@ -856,7 +944,9 @@ function CustomDeviceForm({ info }: { info: TdpInfo }) {
       name: name.trim(),
       minTdp: parse(minTdp),
       maxTdp: parse(maxTdp),
-      batteryMaxTdp: parse(batteryMaxTdp),
+      // Blank => omit, so the backend defaults it to maxTdp. Sending NaN
+      // here would fail validation and re-create the #230 trap.
+      batteryMaxTdp: batteryMaxTdp.trim() === "" ? null : parse(batteryMaxTdp),
       profiles: {
         Silent: parse(silent),
         Balanced: parse(balanced),
@@ -913,7 +1003,7 @@ function CustomDeviceForm({ info }: { info: TdpInfo }) {
   const numberFields: Array<[string, string, (v: string) => void]> = [
     ["Min TDP (W)", minTdp, setMinTdp],
     ["Max TDP (W)", maxTdp, setMaxTdp],
-    ["Battery max TDP (W)", batteryMaxTdp, setBatteryMaxTdp],
+    ["Battery max TDP (W, optional)", batteryMaxTdp, setBatteryMaxTdp],
     ["Silent preset (W)", silent, setSilent],
     ["Balanced preset (W)", balanced, setBalanced],
     ["Performance preset (W)", performance, setPerformance],
@@ -932,7 +1022,8 @@ function CustomDeviceForm({ info }: { info: TdpInfo }) {
           On a newer or unlisted handheld? Enter your device's TDP range and
           power presets. Once saved it becomes the default device used by TDP
           control, overriding auto-detection. Clear it to return to
-          auto-detection.
+          auto-detection. Leave <strong>Battery max TDP</strong> blank to use
+          your Max TDP on battery too.
         </div>
 
         <div style={{ marginBottom: 10 }}>

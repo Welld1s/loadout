@@ -46,9 +46,12 @@ function isWholeNumber(n: unknown): n is number {
 /**
  * Validate an untrusted object into a `CustomDevice`, or return a
  * user-facing error string. Rules: non-empty name; whole-number watts in
- * [MIN_WATTS, MAX_WATTS]; `minTdp < maxTdp`; `minTdp <= batteryMaxTdp <=
- * maxTdp`; each preset within `[minTdp, maxTdp]`. Pure — reused by the
- * backend RPC and by `readCustomDevice` to reject corrupt stored data.
+ * [MIN_WATTS, MAX_WATTS]; `minTdp < maxTdp`; each preset within
+ * `[minTdp, maxTdp]`. `batteryMaxTdp` is OPTIONAL and defaults to `maxTdp`
+ * when omitted — when given it must satisfy `minTdp <= batteryMaxTdp <=
+ * maxTdp`. Whatever it ends up as, BATTERY_SAFE_MAX_WATTS still caps the
+ * applied wattage on battery. Pure — reused by the backend RPC and by
+ * `readCustomDevice` to reject corrupt stored data.
  */
 export function validateCustomDevice(input: unknown): ValidationResult {
   if (!input || typeof input !== "object") {
@@ -68,8 +71,16 @@ export function validateCustomDevice(input: unknown): ValidationResult {
   const ranges: Array<[string, unknown]> = [
     ["Min TDP", o.minTdp],
     ["Max TDP", o.maxTdp],
-    ["Battery max TDP", o.batteryMaxTdp],
   ];
+  // Battery max is OPTIONAL. Requiring it is what produced issue #230: the
+  // form pre-seeded this field from the AUTO-DETECTED device, so raising Max
+  // TDP to 80 while leaving a detected 28-30 here silently capped the slider
+  // at that lower figure whenever the handheld was on battery — with nothing
+  // in the UI saying why. Omitted now means "same as Max TDP", and the global
+  // BATTERY_SAFE_MAX_WATTS ceiling protects the battery regardless.
+  if (o.batteryMaxTdp != null && o.batteryMaxTdp !== "") {
+    ranges.push(["Battery max TDP", o.batteryMaxTdp]);
+  }
   for (const [label, value] of ranges) {
     if (!isWholeNumber(value)) {
       return { ok: false, error: `${label} must be a whole number` };
@@ -83,7 +94,10 @@ export function validateCustomDevice(input: unknown): ValidationResult {
   }
   const minTdp = o.minTdp as number;
   const maxTdp = o.maxTdp as number;
-  const batteryMaxTdp = o.batteryMaxTdp as number;
+  const batteryMaxTdp =
+    o.batteryMaxTdp == null || o.batteryMaxTdp === ""
+      ? maxTdp
+      : (o.batteryMaxTdp as number);
 
   if (minTdp >= maxTdp) {
     return { ok: false, error: "Min TDP must be less than Max TDP" };
@@ -170,4 +184,55 @@ export async function clearCustomDevice(pluginId: string): Promise<void> {
     delete next[STORAGE_KEY];
     return next;
   });
+}
+
+/** Marks the issue-#230 battery-max migration as already considered. */
+const MIGRATED_KEY = "batteryMaxMigrated";
+
+/**
+ * One-time repair of a custom device carrying the issue-#230 seed.
+ *
+ * `batteryMaxTdp` was required from the first release and the form pre-filled
+ * it from the AUTO-DETECTED device, so every custom device saved before this
+ * change has an explicit value — and anyone who raised Max TDP without
+ * noticing that field is still capped by it. Making the field optional only
+ * helps new saves, so existing users need a nudge.
+ *
+ * Runs AT MOST ONCE, ever, guarded by a persisted flag, and rewrites storage
+ * rather than patching in memory. Both properties matter: the seeded values
+ * ARE the fallback defaults (28 W generic-AMD, 30 W generic-Intel), which are
+ * also the roundest numbers a user might deliberately type. A per-load
+ * in-memory heuristic would therefore (a) misfire on a deliberate 28, and
+ * (b) be impossible to escape — re-entering 28 would just be re-migrated on
+ * the next load. Persisting the flag means a value the user sets afterwards
+ * is theirs and is never touched again.
+ *
+ * @returns the previous value if it was migrated away, else null.
+ */
+export async function migrateSeededBatteryMax({
+  pluginId,
+  detectedBatteryMaxTdp,
+}: {
+  pluginId: string;
+  /** batteryMaxTdp of the DMI-detected device — the value the old form seeded. */
+  detectedBatteryMaxTdp: number;
+}): Promise<number | null> {
+  let migratedFrom: number | null = null;
+  await mutatePluginStorage<Record<string, unknown>>(pluginId, (existing) => {
+    if (existing[MIGRATED_KEY]) return existing;
+    const next = { ...existing, [MIGRATED_KEY]: true };
+    const raw = existing[STORAGE_KEY] as Record<string, unknown> | undefined;
+    if (!raw) return next; // nothing to migrate, but never consider it again
+    const stored = validateCustomDevice(raw);
+    if (!stored.ok) return next;
+    const d = stored.device;
+    // Fingerprint of the bug: below the user's own max AND exactly the value
+    // the old form would have seeded from detection.
+    if (d.batteryMaxTdp >= d.maxTdp) return next;
+    if (d.batteryMaxTdp !== detectedBatteryMaxTdp) return next;
+    migratedFrom = d.batteryMaxTdp;
+    const { batteryMaxTdp: _dropped, ...rest } = d;
+    return { ...next, [STORAGE_KEY]: rest };
+  });
+  return migratedFrom;
 }
