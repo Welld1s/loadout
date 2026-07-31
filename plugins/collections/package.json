@@ -1,0 +1,34 @@
+{
+  "name": "@loadout/plugin-collections",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@loadout/types": "workspace:*",
+    "@loadout/plugin-storage": "workspace:*",
+    "@loadout/steam-cdp": "workspace:*",
+    "react": "^18.3.0",
+    "react-icons": "^5.6.0",
+    "@loadout/ui": "workspace:*"
+  },
+  "plugin": {
+    "id": "collections",
+    "name": "Collections",
+    "description": "Manage the Steam collections you already have, and build new ones from rules that keep themselves up to date",
+    "category": "Steam",
+    "subtitle": "Organise your library",
+    "target": {
+      "type": "overlay"
+    },
+    "permissions": {
+      "filesystem": [
+        "read:~/.local/share/Steam",
+        "write:~/.config/loadout/plugins"
+      ],
+      "network": [
+        "localhost",
+        "127.0.0.1"
+      ]
+    }
+  }
+}

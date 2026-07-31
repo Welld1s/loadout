@@ -66,9 +66,19 @@ const PLUGINS = readdirSync(join(ROOT, "plugins"), { withFileTypes: true })
 // is skipped rather than producing a misleading shot.
 type Step =
   | { kind: "tile" }
+  /** A collection card. `last` picks the bottom one — the grid puts
+   *  rule-built collections first, so first/last is managed/linked. */
+  | { kind: "card"; last?: boolean }
   | { kind: "aria"; label: string }
   | { kind: "text"; label: string }
   | { kind: "scrollTo"; label: string }
+  /** Back to the top of the page's scroll box — a windowed grid keeps the
+   *  scroll offset of whatever was open before it, so a sub-page can open
+   *  half way down its own list. */
+  | { kind: "scrollTop" }
+  /** Type into an input matched by placeholder — for screens whose interesting
+   *  state is "something has been searched for". */
+  | { kind: "type"; placeholder: string; text: string }
   | { kind: "wait"; ms: number };
 
 interface PageShot {
@@ -80,6 +90,41 @@ interface PageShot {
 // Per-plugin sub-pages to capture. Settings/config pages are deliberately
 // NOT captured — they're not interesting screenshots.
 const PAGE_RECIPES: Record<string, PageShot[]> = {
+  // The grid lists rule-built collections before the ones already in Steam,
+  // so the first card is managed (its options are the rule builder) and the
+  // last is linked (only those can be edited by hand).
+  collections: [
+    { name: "games", steps: [{ kind: "card" }, { kind: "wait", ms: 400 }, { kind: "scrollTop" }] },
+    { name: "new", steps: [{ kind: "aria", label: "New collection" }] },
+    { name: "rules", steps: [{ kind: "card" }, { kind: "aria", label: "Options" }] },
+    {
+      name: "rule-palette",
+      steps: [
+        { kind: "card" },
+        { kind: "aria", label: "Options" },
+        { kind: "text", label: "Add rule" },
+      ],
+    },
+    {
+      name: "add-games",
+      // Targeted by name, and filtered, for two reasons. The picker opens on
+      // the whole library, so a shot of row 40 of 4358 reads as an accident —
+      // narrowing it also shows the filter, which is the point of the screen.
+      // And this image ships in a public repo: the last card happens to be an
+      // emulator collection here, which puts a console maker's titles and its
+      // name in the frame. A store collection and a Valve filter keep both out
+      // of it. On a device without "Epic Games" the step finds nothing and the
+      // page is skipped, which is the intended behaviour for a missing target.
+      steps: [
+        { kind: "text", label: "Epic Games" },
+        { kind: "aria", label: "Add games" },
+        { kind: "wait", ms: 500 },
+        { kind: "type", placeholder: "Filter", text: "portal" },
+        { kind: "wait", ms: 500 },
+        { kind: "scrollTop" },
+      ],
+    },
+  ],
   recomp: [{ name: "detail", steps: [{ kind: "tile" }] }],
   hltb: [{ name: "detail", steps: [{ kind: "tile" }] }],
   // The landing shot is the Library (available games) tab; only the
@@ -119,11 +164,25 @@ const PAGE_RECIPES: Record<string, PageShot[]> = {
   ],
 };
 
+/**
+ * Plugins whose landing shot is taken with the sidebar collapsed.
+ *
+ * For a plugin whose landing view is a wide grid, the nav column costs a
+ * column of tiles and the shot stops being about the plugin. Collapsed only
+ * for that one frame — it is expanded again before the sub-pages, so a
+ * plugin's shots don't inherit it from whatever ran before them.
+ */
+const LANDING_COLLAPSED: ReadonlySet<string> = new Set(["collections"]);
+
 // Steps run on a plugin's LANDING view before its landing shot — to put a
 // plugin into the state that screenshots best. PlayTime defaults to the
 // week view; "All" shows the full library grid, which reads better.
 const LANDING_SETUP: Record<string, Step[]> = {
   playtime: [{ kind: "text", label: "All" }],
+  // Clear the search first. The overlay is a live device — a capture run can
+  // land while somebody is mid-search, and the landing shot then shows their
+  // half-typed filter over an empty grid.
+  collections: [{ kind: "type", placeholder: "Search collections", text: "" }],
 };
 
 const sleep = (ms: number) => Bun.sleep(ms);
@@ -320,9 +379,14 @@ async function setSidebarCollapsed(cdp: CDP, collapsed: boolean): Promise<void> 
 // ── Recipe step execution ──────────────────────────────────────────────────
 
 /** Click the first element matching `selector`. Returns whether it existed. */
-async function clickSelector(cdp: CDP, selector: string): Promise<boolean> {
+async function clickSelector(
+  cdp: CDP,
+  selector: string,
+  last = false,
+): Promise<boolean> {
   const expr = `(() => {
-    const el = document.querySelector(${JSON.stringify(selector)});
+    const els = [...document.querySelectorAll(${JSON.stringify(selector)})];
+    const el = ${last ? "els[els.length - 1]" : "els[0]"};
     if (!el) return false;
     el.click();
     return true;
@@ -388,6 +452,10 @@ async function runSteps(cdp: CDP, steps: Step[]): Promise<boolean> {
     let ok = false;
     if (step.kind === "tile")
       ok = await clickWithRetry(cdp, () => clickSelector(cdp, "[data-game-card]"));
+    else if (step.kind === "card")
+      ok = await clickWithRetry(cdp, () =>
+        clickSelector(cdp, "[data-collection-card]", step.last),
+      );
     else if (step.kind === "aria")
       ok = await clickWithRetry(cdp, () =>
         clickSelector(cdp, `[aria-label="${step.label}"]`),
@@ -396,6 +464,25 @@ async function runSteps(cdp: CDP, steps: Step[]): Promise<boolean> {
       ok = await clickWithRetry(cdp, () => clickText(cdp, step.label));
     else if (step.kind === "scrollTo")
       ok = await clickWithRetry(cdp, () => scrollToText(cdp, step.label));
+    else if (step.kind === "type")
+      ok =
+        (await cdp.eval(`(() => {
+          const el = document.querySelector('input[placeholder^=${JSON.stringify(step.placeholder)}]');
+          if (!el) return false;
+          const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+          setter.call(el, ${JSON.stringify(step.text)});
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          return true;
+        })()`)) === true;
+    else if (step.kind === "scrollTop")
+      ok =
+        (await cdp.eval(`(() => {
+          for (const el of document.querySelectorAll("*")) {
+            if (el.scrollTop > 0) el.scrollTop = 0;
+          }
+          window.scrollTo(0, 0);
+          return true;
+        })()`)) === true;
     if (!ok) return false;
     await sleep(SETTLE_MS);
     await waitForIdle(cdp); // sub-page may fetch on open (detail pages)
@@ -553,7 +640,10 @@ async function main(): Promise<void> {
     await navigate(cdp, `#/plugin/${pid}`);
     if (LANDING_SETUP[pid]) await runSteps(cdp, LANDING_SETUP[pid]);
     await varyGridView(cdp, pid);
+    const collapse = LANDING_COLLAPSED.has(pid);
+    if (collapse) await setSidebarCollapsed(cdp, true);
     await cdp.screenshot(join(OUT, theme, `${nn}-${pid}.png`));
+    if (collapse) await setSidebarCollapsed(cdp, false);
 
     for (const page of PAGE_RECIPES[pid] ?? []) {
       // Reset to the plugin landing so each page starts from a clean base.
