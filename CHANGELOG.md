@@ -8,6 +8,20 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com).
 
 ---
 
+## [v0.8.0] — 2026-08-02
+
+### Added
+- **Collections — manage your Steam collections from the overlay** (#239, #243) — Every collection you own is on the grid, including the ROM sets EmuDeck and Steam ROM Manager create, and opening one shows exactly what Steam shows. The ones already in Steam can be edited in place: add and remove games, rename, delete. New collections are built from **rules** that keep themselves up to date — *installed but never played*, *under 20 minutes in*, *over 20 GB* — and each rule is priced against your library before you commit to it, so you never build one that turns out empty. There are presets if you would rather not start from nothing. Rule-built collections are written to Steam as real Steam collections, so they appear in Steam's own library and survive Loadout being uninstalled; syncing happens on demand, when you leave the plugin, or at startup if one was owed — never while you are still working, which used to make the plugin look frozen.
+- **Entries Steam can no longer resolve are named rather than hidden** (#239) — A Steam collection stores bare app ids, and a non-Steam shortcut's id is regenerated every time the shortcut is re-added: re-run EmuDeck and the ids that collection holds go dead. Steam quietly skips them, which is why a collection can read as 221 games in one place and 16 in another. Opening one now counts them and offers a two-step **Clean up** that drops only the dead ids. It refuses to run while the library is still loading, when everything looks dead.
+
+### Fixed
+- **Uninstalling no longer leaves your overlay button remapped** (#235) — The overlay's wake button is an InputPlumber profile that remaps a physical button, not a Steam setting, and `uninstall.sh` never touched it. So after uninstalling, that button stayed bound to Loadout and stopped doing what the OS normally does with it — on an OneXPlayer APEX, opening the on-screen keyboard — with nothing pointing back at Loadout. Uninstalling now reverts the mapping.
+- **Steam UI patches apply where they matter, and say so when they don't** (#238, #240) — The patcher behind Steam-modifying plugins skipped any module over 200,000 characters before it even looked at what it had been asked to match, which excluded Steam's own library module (646,312 characters on the 2026-07 client) — the one such a patcher exists for. A patch against it matched nothing and warned nothing, which is indistinguishable from a wrong pattern. Patches from plugins with a hyphen in their id (most of them) were also silently broken, the unmatched-patch warning was never re-armed after a reload, and re-injecting could hook Steam twice.
+
+### Upgrade notes
+- **Collections ships new in this release, so it can land disabled** if you are upgrading — plugin enablement is a deny-list, and that list was fixed to your visible set when you first upgraded to v0.7.0. If Collections isn't in your overlay, enable it in **Settings → Plugins**.
+- Collections writes **real Steam collections**. A rule-built collection re-evaluates on every sync, so it can drop a game whose rules stopped matching — that is the point of it, and the card says *"Rules · updates itself"* before you open it. Collections that were already in Steam are never given rules, and nothing writes to one unless you edit it yourself.
+
 ## [v0.7.2] — 2026-07-29
 
 ### Fixed
