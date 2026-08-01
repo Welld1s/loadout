@@ -25,6 +25,7 @@
 import type { EvalResult, RuleNodeTrace } from "./evaluate";
 import type { FactKey, GroupRule, Rule, ManagedCollection } from "./types";
 import { leafRules } from "./rules";
+import { paramSpecs } from "./rule-params";
 import { asRoot, removeRule } from "./rule-tree";
 import { summarizeRule } from "./summarize";
 
@@ -171,6 +172,17 @@ export interface DiagnoseContext {
   /** Total games in the library, before any rule ran. */
   librarySize: number;
   /**
+   * Whether that library can be believed.
+   *
+   * `librarySize` alone cannot tell a small library from a half-read one:
+   * Steam's own read degrades to *some* games — the installed ones — long
+   * before it has the owned set, so a thin snapshot arrives non-empty and
+   * every diagnosis below becomes a confident claim about somebody's library
+   * built on a partial read of it. Defaults to `true` for callers that have no
+   * way of knowing; the ones that do should pass it.
+   */
+  libraryLoaded?: boolean;
+  /**
    * Match count the tab would have with the root combinator flipped.
    * Supplied by the caller because computing it needs another evaluation
    * pass, and only the editor needs it.
@@ -192,8 +204,15 @@ export function diagnoseCollection(
   ctx: DiagnoseContext,
 ): Diagnosis {
   // A tab that is showing games needs no explanation — except when the cap
-  // is hiding most of them, which surprises people.
-  if (result.matched.length > 0) {
+  // is hiding most of them, which surprises people, and except when a rule
+  // couldn't be checked at all.
+  //
+  // That second exception is the important one: `indeterminate` resolves to a
+  // match under the default policy, so a rule reading a fact no resolver
+  // supplies passes *every* game. The collection looks healthy, quietly
+  // contains the whole library, and gets mirrored into Steam that way. Exiting
+  // here on "it has matches" is what hid it.
+  if (result.matched.length > 0 && result.blockedFacts.length === 0) {
     if (
       tab.limit !== null &&
       result.cappedOut > 0 &&
@@ -210,11 +229,17 @@ export function diagnoseCollection(
     return { kind: "ok" };
   }
 
-  // 1. Nothing to filter.
-  if (ctx.librarySize === 0) {
+  // 1. Nothing to filter, or nothing we can trust. Both outrank every rule
+  //    diagnosis below: those all read "your rules are wrong", and saying that
+  //    about a library we haven't finished reading sends people editing rules
+  //    that were fine.
+  if (ctx.librarySize === 0 || ctx.libraryLoaded === false) {
     return {
       kind: "empty-library",
-      message: "Your library hasn't been scanned yet",
+      message:
+        ctx.librarySize === 0
+          ? "Your library hasn't been scanned yet"
+          : "Still reading your library — counts and warnings arrive with it",
       fixes: [],
     };
   }
@@ -241,7 +266,10 @@ export function diagnoseCollection(
       message:
         `${ruleCount} rule${ruleCount === 1 ? "" : "s"} couldn't be checked: ` +
         // The resolver's own sentence, verbatim — it knows why.
-        reasons.join(" "),
+        reasons.join(" ") +
+        (result.matched.length > 0 && tab.indeterminatePolicy !== "fail"
+          ? ` Until that data arrives ${ruleCount === 1 ? "it matches" : "they match"} everything, so this is wider than it looks.`
+          : ""),
       fixes:
         tab.indeterminatePolicy === "fail"
           ? [FIX_IGNORE_UNCHECKED]
@@ -300,7 +328,14 @@ export function diagnoseCollection(
   // Only suggest widening when there is something to widen. A tab whose one
   // rule is `familyShared` has no range anywhere in the tree, and telling its
   // owner to widen one sends them looking for a control that isn't there.
-  const hasRange = leafRules(tab.root).some((r) => "range" in r || "epochSec" in r);
+  // No rule variant has a `range` property — ranges are named `minutes`,
+  // `bytes`, `percent`, `score`, `hours`, `epochSec`. Testing for one meant
+  // only the three date kinds were recognised and every other range rule was
+  // told to remove itself when widening a bound was the actual fix. The
+  // registry already knows which params are ranges.
+  const hasRange = leafRules(tab.root).some((r) =>
+    paramSpecs(r.kind).some((spec) => spec.control === "range"),
+  );
   return {
     kind: "genuinely-empty",
     message: hasRange

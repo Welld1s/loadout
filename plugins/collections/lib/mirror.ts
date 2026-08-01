@@ -1,11 +1,12 @@
 /**
  * What syncing the mirror *would* do.
  *
- * This is the whole reason tabs can appear in Steam's own UI without patching
- * Steam. TabMaster injects itself into the library's React tree by hot-swapping
- * the `useMemo` dispatcher; when that breaks, the library becomes unreachable
- * and users report rebooting nineteen times. We write real Steam collections
- * instead, which Steam renders natively and which survive us being uninstalled.
+ * This is the whole reason a collection built here appears in Steam's own UI
+ * without patching Steam. TabMaster injects itself into the library's React
+ * tree by hot-swapping the `useMemo` dispatcher; when that breaks, the library
+ * becomes unreachable and users report rebooting nineteen times. We write real
+ * Steam collections instead, which Steam renders natively and which survive us
+ * being uninstalled.
  *
  * The planner is **pure and CDP-free** for two reasons. It is the part that can
  * destroy user data — a wrong id here deletes a collection someone spent an
@@ -14,8 +15,8 @@
  * possible if planning and executing are separate steps.
  *
  * Identity comes from the ledger, never from a collection's name. Names are the
- * user's; matching on them would let a tab called "Backlog" quietly take over a
- * collection the user made by hand years ago.
+ * user's; matching on them would let a collection called "Backlog" quietly take
+ * over one the user made by hand years ago.
  */
 
 import type { MirrorLedger, MirrorLedgerEntry, ManagedCollection } from "./types";
@@ -89,6 +90,17 @@ export interface PlanMirrorArgs {
   steamCollections: readonly SteamCollection[];
   /** Optional prefix for the collection name. Empty by default. */
   namePrefix?: string;
+  /**
+   * Managed ids whose rules this build cannot actually evaluate — a rule
+   * reading a fact no resolver supplies.
+   *
+   * Such a rule returns `indeterminate`, which the default policy counts as a
+   * match, so the collection quietly matches the **whole library**. Writing
+   * that to Steam is the same accident `unbuilt` exists to prevent, reached by
+   * a different door: the rule looks built, and the membership looks huge
+   * because it is.
+   */
+  unevaluable?: ReadonlySet<string>;
 }
 
 function emptyPlan(): MirrorPlan {
@@ -131,7 +143,14 @@ export function collectionNameFor(
  * a collection and reusing the old name in the same sync doesn't collide.
  */
 export function planMirror(args: PlanMirrorArgs): MirrorPlan {
-  const { collections, evaluated, ledger, steamCollections, namePrefix = "" } = args;
+  const {
+    collections,
+    evaluated,
+    ledger,
+    steamCollections,
+    namePrefix = "",
+    unevaluable = new Set<string>(),
+  } = args;
   const plan = emptyPlan();
 
   const steamById = new Map(steamCollections.map((c) => [c.id, c]));
@@ -155,6 +174,36 @@ export function planMirror(args: PlanMirrorArgs): MirrorPlan {
    */
   const unbuilt = (collection: ManagedCollection) => collection.root.children.length === 0;
 
+  /**
+   * Why this collection must not be written, or null if it may be.
+   *
+   * `mirrored` changes what the refusal is *about*. For a collection Steam has
+   * never seen, refusing prevents the accident. For one already in Steam —
+   * mirrored by an earlier build that had no such guard, so its Steam
+   * collection is the whole library right now — refusing only stops it getting
+   * worse, and saying "would put your whole library in Steam" describes a
+   * thing that has already happened. Say what is actually true, and what to do
+   * about it: this planner never deletes on the user's behalf.
+   */
+  const refuse = (collection: ManagedCollection, mirrored: boolean): string | null => {
+    if (unbuilt(collection)) {
+      return mirrored
+        ? `"${collection.label}" has no rules, so it is left exactly as it is in Steam. ` +
+            `Add a rule to sync it, or delete it to remove it from Steam.`
+        : `"${collection.label}" has no rules yet, so it would match your whole library.`;
+    }
+    if (unevaluable.has(collection.id)) {
+      const why =
+        `"${collection.label}" has a rule this build can't check, and an unchecked rule ` +
+        `matches every game.`;
+      return mirrored
+        ? `${why} Its Steam collection is left as it is — which may be your whole library, ` +
+            `if it was synced before. Delete it, or change the rule.`
+        : `${why} Syncing it would put your whole library in Steam.`;
+    }
+    return null;
+  };
+
   // Two passes, because a create has to know what the renames will free.
   // Swapping two collections' names is otherwise reported as a conflict
   // forever: the new one's name is held by a collection that is, in this very
@@ -164,11 +213,9 @@ export function planMirror(args: PlanMirrorArgs): MirrorPlan {
   for (const collection of collections) {
     const entry = ledgerByManaged.get(collection.id);
     if (!entry) continue;
-    if (unbuilt(collection)) {
-      plan.skipped.push({
-        managedId: collection.id,
-        reason: `"${collection.label}" has no rules yet, so it would match your whole library.`,
-      });
+    const refusal = refuse(collection, true);
+    if (refusal) {
+      plan.skipped.push({ managedId: collection.id, reason: refusal });
       continue;
     }
 
@@ -271,11 +318,9 @@ export function planMirror(args: PlanMirrorArgs): MirrorPlan {
   // Pass 2 — collections with no Steam collection yet.
   for (const collection of collections) {
     if (ledgerByManaged.has(collection.id)) continue;
-    if (unbuilt(collection)) {
-      plan.skipped.push({
-        managedId: collection.id,
-        reason: `"${collection.label}" has no rules yet, so it would match your whole library.`,
-      });
+    const refusal = refuse(collection, false);
+    if (refusal) {
+      plan.skipped.push({ managedId: collection.id, reason: refusal });
       continue;
     }
 
@@ -319,9 +364,15 @@ export function planMirror(args: PlanMirrorArgs): MirrorPlan {
  * ledger through the same config setter that triggers auto-sync, so without a
  * check on *what* changed the mirror would sync itself in a loop forever.
  *
- * Compared as a projection rather than field-by-field, so a new field on `Tab`
- * is included by default. Being too eager here costs a redundant sync; being
- * too lazy leaves Steam silently stale, which is the failure users can't see.
+ * Compared as a **projection**, which means the field list is a whitelist, not
+ * a default. A new membership-affecting field on {@link ManagedCollection} —
+ * an exclude list, a per-collection cap — would not mark a sync owed until
+ * somebody remembered to add it, and Steam then goes silently stale, which is
+ * the failure users can't see. {@link COLLECTION_FIELDS} is what stops that
+ * being a matter of remembering.
+ *
+ * Being too eager costs a redundant sync; being too lazy costs correctness, so
+ * when in doubt, classify the field as `membership`.
  */
 export function mirrorAffecting(
   before: MirrorRelevantConfig,
@@ -338,18 +389,41 @@ export interface MirrorRelevantConfig {
   mirror: { autoSync: boolean };
 }
 
+/**
+ * Every field of a managed collection, classified by whether changing it can
+ * change what Steam ends up holding.
+ *
+ * Keyed on `keyof ManagedCollection` and **in a compiled module**, not a test:
+ * `tsconfig.json` excludes `*.test.ts`, so the same map in a spec file would
+ * never be typechecked and a new field would sail past it. Here, adding one to
+ * the type fails the build until somebody classifies it — which is the whole
+ * point, since the alternative failure is silent and lands on the user's Steam
+ * library.
+ */
+const COLLECTION_FIELDS: Record<keyof ManagedCollection, "membership" | "cosmetic"> = {
+  id: "membership",
+  // The name reaches Steam, so a rename is a sync-worthy change.
+  label: "membership",
+  root: "membership",
+  sort: "membership",
+  limit: "membership",
+  manualOrder: "membership",
+  indeterminatePolicy: "membership",
+  display: "cosmetic",
+  icon: "cosmetic",
+};
+
+const MEMBERSHIP_FIELDS = (Object.keys(COLLECTION_FIELDS) as Array<keyof ManagedCollection>).filter(
+  (key) => COLLECTION_FIELDS[key] === "membership",
+);
+
 function project(config: MirrorRelevantConfig) {
   return {
-    collections: config.collections.map((c) => ({
-      id: c.id,
-      // The name reaches Steam, so a rename is a sync-worthy change.
-      label: c.label,
-      root: c.root,
-      sort: c.sort,
-      limit: c.limit,
-      manualOrder: c.manualOrder,
-      policy: c.indeterminatePolicy,
-    })),
+    // Derived from the classification rather than restating it: two lists that
+    // have to agree eventually don't.
+    collections: config.collections.map((c) =>
+      Object.fromEntries(MEMBERSHIP_FIELDS.map((key) => [key, c[key]])),
+    ),
     // Whitelists and blacklists live here, so they change membership.
     overrides: config.gameOverrides,
     prefix: config.settings.namePrefix,

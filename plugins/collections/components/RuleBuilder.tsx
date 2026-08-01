@@ -29,7 +29,7 @@ import { countMatches, evaluateCollection } from "../lib/evaluate";
 import { diagnoseCollection } from "../lib/diagnose";
 import { ruleCandidate } from "../lib/rule-params";
 import type { ParamOption } from "../lib/rule-params";
-import { RULE_KINDS, factUnavailableReason, requiredFacts } from "../lib/rules";
+import { RULE_KINDS, factUnavailableReason, requiredFacts, ruleDef } from "../lib/rules";
 import {
   asRoot,
   duplicateRule,
@@ -59,6 +59,16 @@ function isInverted(rule: Rule): boolean {
 export interface RuleBuilderProps {
   collection: ManagedCollection;
   games: readonly EvalGame[];
+  /**
+   * Whether `games` is the whole library or whatever had arrived.
+   *
+   * Everything on this screen is a number priced against it — "→ 30 games",
+   * "Nothing in your library matches this rule", "try widening a range". Said
+   * about a half-read library they are all wrong, and wrong in the direction
+   * that sends somebody editing rules that were fine. The counts go quiet
+   * until the library is there.
+   */
+  libraryLoaded?: boolean;
   onSave: (collection: ManagedCollection) => void;
   onCancel: () => void;
   /**
@@ -100,6 +110,7 @@ function collectGroups(rule: Rule, into: GroupRule[] = []): GroupRule[] {
 export function RuleBuilder({
   collection,
   games,
+  libraryLoaded = true,
   onSave,
   onCancel,
   onDelete,
@@ -182,28 +193,36 @@ export function RuleBuilder({
     () =>
       diagnoseCollection(draft, result, {
         librarySize: games.length,
+        libraryLoaded,
         flippedCombinatorCount:
           groupCounts.get(draft.root.id)?.[
             draft.root.combinator === "all" ? "any" : "all"
           ] ?? 0,
       }),
-    [draft, result, games.length, groupCounts],
+    [draft, result, games.length, groupCounts, libraryLoaded],
   );
 
-  /** Count the collection would show with `rule` swapped in — used by the editor. */
+  /**
+   * Count the collection would show with `rule` swapped in — used by the
+   * editor. `null` while the library is still arriving: the editor turns a
+   * zero into "saving this will empty the collection", which is a claim about
+   * the user's library rather than about their rule.
+   */
   const countFor = useCallback(
     (rule: Rule) =>
-      countMatches(
-        {
-          root: asRoot({
-            candidate: replaceRule({ root: draft.root, id: rule.id, next: rule }),
-            fallback: draft.root,
-          }),
-          indeterminatePolicy: draft.indeterminatePolicy,
-        },
-        games,
-      ),
-    [draft.root, draft.indeterminatePolicy, games],
+      libraryLoaded
+        ? countMatches(
+            {
+              root: asRoot({
+                candidate: replaceRule({ root: draft.root, id: rule.id, next: rule }),
+                fallback: draft.root,
+              }),
+              indeterminatePolicy: draft.indeterminatePolicy,
+            },
+            games,
+          )
+        : null,
+    [draft.root, draft.indeterminatePolicy, games, libraryLoaded],
   );
 
   // The palette prices ~32 candidates. Deferring keeps the tree interactive
@@ -230,6 +249,10 @@ export function RuleBuilder({
       }
 
       if (candidate.needsInput) return candidate;
+      // Unpriced rather than priced against a partial library: "→ 0 games" is
+      // read as a fact about the rule, and `PricedCandidate` already renders
+      // an absent total as no claim at all.
+      if (!libraryLoaded) return candidate;
       const withCandidate = insertRule({
         root: deferredRoot,
         parentId: paletteParent,
@@ -246,7 +269,16 @@ export function RuleBuilder({
         ),
       };
     });
-  }, [paletteParent, deferredRoot, draft.root, draft.indeterminatePolicy, games, now, availableFacts]);
+  }, [
+    paletteParent,
+    deferredRoot,
+    draft.root,
+    draft.indeterminatePolicy,
+    games,
+    libraryLoaded,
+    now,
+    availableFacts,
+  ]);
 
   // ── Actions ────────────────────────────────────────────────────────
 
@@ -254,7 +286,12 @@ export function RuleBuilder({
     (rule: Rule): RuleRowAction[] => {
       const parent = findParent(draft.root, rule.id);
       const at = parent?.children.findIndex((c) => c.id === rule.id) ?? -1;
-      const invertible = rule.kind !== "whitelist" && rule.kind !== "blacklist";
+      // The registry decides, not a local guess. Inverting a range rule turns
+      // "unknown" into a match — `matchRange` resolves the `-1` sentinel to a
+      // definite false, which invert flips to true — so "NOT played 2 hours or
+      // less" would collect every game whose playtime we couldn't read. The
+      // rule editor already gated on this flag; the row menu did not.
+      const invertible = rule.kind !== "group" && ruleDef(rule.kind)?.invertible === true;
 
       const close = () => setMenuOpenId(null);
       const apply = (next: Rule) => {
@@ -371,6 +408,11 @@ export function RuleBuilder({
           onPick={(candidate) => {
             const parentId = paletteParent;
             if (parentId === null) return;
+            // The card is dimmed and says why, but pressing it used to insert
+            // the rule anyway — and a rule whose fact nothing resolves passes
+            // every game, so the collection silently became the whole library
+            // and was mirrored into Steam that way.
+            if (candidate.unavailable) return;
             const rule = { ...candidate.rule, id: newId() } as Rule;
             setRoot(insertRule({ root: draft.root, parentId, rule }));
             setPaletteParent(null);

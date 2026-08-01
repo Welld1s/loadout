@@ -124,6 +124,24 @@ export function CollectionDetail({
   }, [games, filter]);
 
   const selectedSet = useMemo(() => new Set(selected), [selected]);
+  /** Picked, but filtered out of view — the removals you cannot see. */
+  const hiddenPicked = useMemo(() => {
+    if (!shown) return 0;
+    // A set, not a scan per pick: this recomputes on every keystroke, and the
+    // collection this component exists for holds 700 entries.
+    const visible = new Set(shown.map((g) => g.appId));
+    return selected.filter((id) => !visible.has(id)).length;
+  }, [selected, shown]);
+
+  /**
+   * The name as it appears *inside* the delete confirm, bounded.
+   *
+   * That button already carries a whole sentence, and it sits in a `shrink-0`
+   * header row — so an EmuDeck-style "Nintendo 64 (ROMs, no-intro)" pushes the
+   * part that matters ("…stay in your library") off the edge. The full name is
+   * in the heading directly above it, which is where it belongs.
+   */
+  const shortLabel = label.length > 24 ? `${label.slice(0, 23)}…` : label;
 
   const rowWindow = useVisibleRows({
     total: shown?.length ?? 0,
@@ -153,7 +171,13 @@ export function CollectionDetail({
                 : editing
                   ? selected.length === 0
                     ? "Pick the ones to remove"
-                    : `${selected.length} picked`
+                    : hiddenPicked > 0
+                      ? // The count that matters when a filter is on: picks
+                        // survive it, so confirming can remove games that are
+                        // not on screen. Saying only "3 picked" while showing
+                        // one tile is how that goes unnoticed.
+                        `${selected.length} picked · ${hiddenPicked} not shown`
+                      : `${selected.length} picked`
                   : shown && shown.length !== games.length
                     ? `${shown.length} of ${games.length} games`
                     : `${games.length} games`}
@@ -162,7 +186,12 @@ export function CollectionDetail({
           <div className="flex items-center gap-2 shrink-0">
             {/* A long ROM collection is unusable without this: 700+ tiles is
                 not something you scroll to the middle of with a thumbstick. */}
-            {games !== null && games.length > 0 ? (
+            {/* Hidden while the delete confirm is up: that confirm is a
+                sentence, not an icon, and this row is `shrink-0` — 180px of
+                filter beside it is what pushes a long collection name off the
+                edge of a handheld's header. Filtering is not the task at that
+                moment anyway. */}
+            {games !== null && games.length > 0 && !confirmingDelete ? (
               <SearchField
                 value={filter}
                 onChange={setFilter}
@@ -173,19 +202,25 @@ export function CollectionDetail({
             ) : null}
             {editing ? (
               <>
-                <Button
-                  variant="danger"
-                  disabled={selected.length === 0}
-                  onClick={() => {
-                    onRemoveGames?.([...selected]);
-                    setSelected([]);
-                    setEditing(false);
-                  }}
-                >
-                  {selected.length === 0
-                    ? "Remove from collection"
-                    : `Remove ${selected.length} from collection`}
-                </Button>
+                {/* Gated on the handler rather than disabled by it: a disabled
+                    button that could never have been reached is a branch no
+                    test can cover, and the Done button below has to stay
+                    outside the gate so edit mode always has an exit. */}
+                {onRemoveGames ? (
+                  <Button
+                    variant="danger"
+                    disabled={selected.length === 0}
+                    onClick={() => {
+                      onRemoveGames([...selected]);
+                      setSelected([]);
+                      setEditing(false);
+                    }}
+                  >
+                    {selected.length === 0
+                      ? "Remove from collection"
+                      : `Remove ${selected.length} from collection`}
+                  </Button>
+                ) : null}
                 <IconButton
                   onClick={() => {
                     setEditing(false);
@@ -200,7 +235,15 @@ export function CollectionDetail({
             ) : null}
             {onRemoveGames && !editing ? (
               <IconButton
-                onClick={() => setEditing(true)}
+                onClick={() => {
+                  // Disarm both: the confirms are hidden while editing, and
+                  // coming back to a live destructive button from an intent
+                  // expressed several interactions ago is one press from
+                  // disaster.
+                  setConfirmingDelete(false);
+                  setConfirmingCleanUp(false);
+                  setEditing(true);
+                }}
                 title="Edit collection"
                 ariaLabel="Edit collection"
               >
@@ -214,16 +257,19 @@ export function CollectionDetail({
                 press is the one that acts. */}
             {editing ? null : confirmingDelete ? (
               <>
-                <Button variant="danger" onClick={onDelete}>
-                  Remove collection
+                {/* "Keep it" first, and the destructive button renamed and
+                    told to say what it destroys: the trigger and its
+                    confirmation used to share an accessible name *and* a
+                    screen position, so two quick presses on what reads as one
+                    control deleted a 700-entry collection. */}
+                <Button variant="neutral" onClick={() => setConfirmingDelete(false)}>
+                  Keep it
                 </Button>
-                <IconButton
-                  onClick={() => setConfirmingDelete(false)}
-                  title="Keep it"
-                  ariaLabel="Keep it"
-                >
-                  <FaXmark size={13} />
-                </IconButton>
+                <Button variant="danger" onClick={onDelete}>
+                  {games === null
+                    ? `Delete “${shortLabel}”`
+                    : `Delete “${shortLabel}” (${games.length} games stay in your library)`}
+                </Button>
               </>
             ) : (
               <IconButton

@@ -37,11 +37,18 @@ function withHeader(ui: React.ReactElement) {
   return render(<PluginHeaderSlotProvider slot={slot}>{ui}</PluginHeaderSlotProvider>);
 }
 
-function renderBuilder(t: ManagedCollection) {
+function renderBuilder(t: ManagedCollection, props: { libraryLoaded?: boolean } = {}) {
   const onSave = mock((_: ManagedCollection) => {});
   const onCancel = mock(() => {});
   const view = withHeader(
-    <RuleBuilder collection={t} games={games} onSave={onSave} onCancel={onCancel} now={NOW} />,
+    <RuleBuilder
+      collection={t}
+      games={games}
+      onSave={onSave}
+      onCancel={onCancel}
+      now={NOW}
+      {...props}
+    />,
   );
   return { onSave, onCancel, view };
 }
@@ -211,6 +218,23 @@ describe("RuleBuilder — row actions", () => {
     openRowMenu(/Actions for Only these games/);
     expect(screen.queryByRole("button", { name: "Invert" })).toBeNull();
   });
+
+  it("offers no invert on a range rule, where it would match the unknowns", () => {
+    // `matchRange` resolves the -1 "unknown" sentinel to a definite false, and
+    // invert flips it to true — so "NOT played 2 hours or less" would collect
+    // every game whose playtime couldn't be read. The registry marks these
+    // non-invertible and the rule editor honoured it; the row menu used its
+    // own guess (`kind !== whitelist && kind !== blacklist`).
+    renderBuilder(tab([{ id: "p", kind: "playtime", minutes: { max: 120 } }]));
+    openRowMenu(/Actions for /);
+    expect(screen.queryByRole("button", { name: "Invert" })).toBeNull();
+  });
+
+  it("still offers invert where the registry allows it", () => {
+    renderBuilder(tab([{ id: "i", kind: "installed" }]));
+    openRowMenu(/Actions for /);
+    expect(screen.getByRole("button", { name: "Invert" })).toBeTruthy();
+  });
 });
 
 describe("RuleBuilder — the palette", () => {
@@ -264,6 +288,37 @@ describe("RuleBuilder — the palette", () => {
     expect(card?.textContent).not.toContain("Needs Steam friends data");
   });
 
+  it("won't add a rule whose data nothing supplies", () => {
+    // The card is dimmed and says why, but pressing it used to insert the rule
+    // anyway — and a rule reading a fact no resolver answers evaluates to
+    // `indeterminate`, which the default policy counts as a match. The
+    // collection silently became the whole library.
+    const { onSave } = renderBuilder(tab([]));
+    fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
+
+    const blocked = screen.getAllByRole("button", { name: /How long to beat/ })[0]!;
+    fireEvent.click(blocked);
+
+    // Still on the palette, nothing inserted.
+    expect(screen.getByRole("button", { name: /How long to beat/ })).toBeTruthy();
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it("takes the card the D-pad can't use out of the way", () => {
+    // Refusing the press is only half of it: a control the stick stops on and
+    // A does nothing to reads as the plugin having hung. `PresetRow` gates its
+    // focus the same way and says so.
+    renderBuilder(tab([]));
+    fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
+
+    const blocked = screen.getAllByRole("button", { name: /How long to beat/ })[0]!;
+    expect(blocked.hasAttribute("disabled")).toBe(true);
+    // And a rule that simply matches nothing right now is still pickable —
+    // "0 games" is information, not a broken rule.
+    const installed = screen.getAllByRole("button", { name: /Installed/ })[0]!;
+    expect(installed.hasAttribute("disabled")).toBe(false);
+  });
+
   it("adds the picked rule to the tree", () => {
     const { onSave } = renderBuilder(tab([]));
     fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
@@ -285,6 +340,32 @@ describe("RuleBuilder — diagnostics", () => {
     expect(screen.getByText(/never both be true/i)).toBeTruthy();
   });
 
+  it("won't diagnose the rules against a library that is still arriving", () => {
+    // Every diagnosis on this screen reads "your rules are wrong". Said about
+    // a half-read library they are all wrong themselves, and wrong in the
+    // direction that sends somebody editing rules that were fine — the same
+    // "reported as facts about the user's library" mistake the pages beside
+    // it were fixed for.
+    renderBuilder(
+      tab([{ id: "a", kind: "installed" }, { id: "b", kind: "installed", invert: true }]),
+      { libraryLoaded: false },
+    );
+    expect(screen.queryByText(/never both be true/i)).toBeNull();
+    expect(screen.getByText(/Still reading your library/i)).toBeTruthy();
+  });
+
+  it("leaves the palette unpriced until then, rather than pricing it at zero", () => {
+    // "→ 0 games" is read as a fact about the rule, not about the read.
+    renderBuilder(tab([]), { libraryLoaded: false });
+    fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    expect(screen.queryByText(/→ \d+ games?/)).toBeNull();
+  });
+
+  it("prices it once the library is there", () => {
+    renderBuilder(tab([]));
+    fireEvent.click(screen.getByRole("button", { name: "Add rule" }));
+    expect(screen.getAllByText(/→ \d+ games?/).length).toBeGreaterThan(0);
+  });
 });
 
 describe("RuleBuilder — generated rule ids", () => {

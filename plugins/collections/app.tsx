@@ -43,6 +43,28 @@ import type { ManagedCollection } from "./lib/types";
 
 export { FaLayerGroup as icon };
 
+/** How many times to ask for the library before settling for what we got. */
+const SNAPSHOT_ATTEMPTS = 4;
+/** Multiplied by the attempt number, so 1s, 2s, 3s. */
+const SNAPSHOT_RETRY_MS = 1000;
+
+/**
+ * Whether the library snapshot can be *believed* — not merely whether the call
+ * came back.
+ *
+ * `getSnapshot` never rejects on a bad read: both its sources degrade to empty,
+ * so a Steam that hasn't finished hydrating answers with a well-formed snapshot
+ * of nothing. Testing `snapshot !== null` treats that as a loaded library and
+ * the screens priced against it then state it as fact — "every game in your
+ * library is already in this collection", twelve presets greyed out blaming
+ * play history. This is the same condition the backend refuses to sync or
+ * prune on, for the same reason.
+ */
+function snapshotIsUsable(snapshot: GameMetadataSnapshot | null): boolean {
+  if (snapshot === null) return false;
+  return snapshot.providers.appstore?.status === "ok" && snapshot.games.length > 0;
+}
+
 interface CollectionSummary {
   id: string;
   label: string;
@@ -163,17 +185,47 @@ export function Collections() {
   useEffect(() => {
     if (!ready) return;
     void loadGrid();
+    let cancelled = false;
     void (async () => {
-      try {
-        const [snap] = await Promise.all([
-          call("getSnapshot") as Promise<GameMetadataSnapshot>,
-          loadConfig(),
-        ]);
-        setSnapshot(snap);
-      } catch {
-        // The grid still works without these; only rule editing needs them.
+      // Retried while the answer is one we can't believe. `getSnapshot` never
+      // *fails* — both its sources degrade to empty — so a Steam that hasn't
+      // finished hydrating returns a perfectly well-formed snapshot of nothing,
+      // and one fetch would leave every screen priced against it for the rest
+      // of the session. Bounded: this is a webview waiting on a library, not a
+      // poller.
+      let haveConfig = false;
+      for (let attempt = 0; attempt < SNAPSHOT_ATTEMPTS && !cancelled; attempt++) {
+        if (attempt > 0) {
+          await new Promise((r) => setTimeout(r, SNAPSHOT_RETRY_MS * attempt));
+          if (cancelled) return;
+        }
+        // Separately, so one failing doesn't discard the other's answer. They
+        // used to share a `Promise.all`: a config read that threw dropped a
+        // library that had arrived perfectly well, and — once this became a
+        // loop — the config was never asked for again, leaving the rules
+        // screen on a spinner for the rest of the session.
+        if (!haveConfig) {
+          try {
+            await loadConfig();
+            haveConfig = true;
+          } catch {
+            // Retried on the next pass, like the snapshot.
+          }
+        }
+        if (cancelled) return;
+        try {
+          const snap = (await call("getSnapshot")) as GameMetadataSnapshot;
+          if (cancelled) return;
+          setSnapshot(snap);
+          if (haveConfig && snapshotIsUsable(snap)) return;
+        } catch {
+          // The grid still works without these; only rule editing needs them.
+        }
       }
     })();
+    return () => {
+      cancelled = true;
+    };
   }, [ready, loadGrid, loadConfig, call]);
 
   /**
@@ -264,10 +316,11 @@ export function Collections() {
     // row windowing measures against.
     return (
       <AddGamesPage
-          label={view.label}
-          candidates={(snapshot?.games ?? [])
-            .filter((g) => !already.has(g.appId))
-            .map((g) => ({ appId: g.appId, name: g.name, installed: g.installed }))}
+        libraryLoaded={snapshotIsUsable(snapshot)}
+        label={view.label}
+        candidates={(snapshot?.games ?? [])
+          .filter((g) => !already.has(g.appId))
+          .map((g) => ({ appId: g.appId, name: g.name, installed: g.installed }))}
         onBack={() => setView({ kind: "detail", id: view.id, label: view.label })}
         onAdd={(appIds) => void addToLinked(view.id, view.label, appIds)}
       />
@@ -281,6 +334,7 @@ export function Collections() {
         <NewCollectionPage
           existingNames={(summaries ?? []).map((c) => c.label)}
           games={evalGames}
+          libraryLoaded={snapshotIsUsable(snapshot)}
           onBack={() => setView({ kind: "grid" })}
           onPickPreset={(preset) => void createCollection(preset.label, preset)}
           onCreate={(label) => void createCollection(label)}
@@ -331,6 +385,7 @@ export function Collections() {
         <RuleBuilder
           collection={editing}
           games={evalGames}
+          libraryLoaded={snapshotIsUsable(snapshot)}
           onCancel={() => void openCollection(editing)}
           onSave={(next) => void saveCollection(next)}
           onDelete={() => void removeCollection(editing.id)}
@@ -548,6 +603,7 @@ export function Collections() {
 
   /** Drop every entry Steam can no longer resolve — see `listGames`. */
   async function cleanUpLinked(id: string) {
+    const request = openRequest.current;
     const before = staleCount;
     setStaleCount(0);
     try {
@@ -560,7 +616,10 @@ export function Collections() {
       );
       await loadGrid();
     } catch (err) {
-      setStaleCount(before);
+      // Same token as `openCollection`: by the time this lands the user may be
+      // looking at a different collection, and painting this one's state under
+      // that one's header is how an edit gets aimed at the wrong thing.
+      if (request === openRequest.current) setStaleCount(before);
       notify(err instanceof Error ? err.message : "Couldn't clean that collection up", {
         kind: "error",
       });
@@ -568,6 +627,7 @@ export function Collections() {
   }
 
   async function addToLinked(id: string, label: string, appIds: string[]) {
+    const request = openRequest.current;
     const before = games ?? [];
     const nameOf = new Map((snapshot?.games ?? []).map((g) => [g.appId, g.name] as const));
     const added = appIds.map((appId) => ({ appId, name: nameOf.get(appId) ?? appId }));
@@ -581,7 +641,7 @@ export function Collections() {
       await call("editLinked", id, { add: appIds });
       await loadGrid();
     } catch (err) {
-      setGames(before);
+      if (request === openRequest.current) setGames(before);
       notify(err instanceof Error ? err.message : "Couldn't update that collection", {
         kind: "error",
       });
@@ -589,6 +649,7 @@ export function Collections() {
   }
 
   async function removeFromLinked(id: string, appIds: readonly string[]) {
+    const request = openRequest.current;
     const before = games ?? [];
     const dropped = new Set(appIds);
     const next = before.filter((g) => !dropped.has(g.appId));
@@ -599,7 +660,7 @@ export function Collections() {
       await call("editLinked", id, { remove: [...appIds] });
       await loadGrid();
     } catch (err) {
-      setGames(before);
+      if (request === openRequest.current) setGames(before);
       notify(err instanceof Error ? err.message : "Couldn't update that collection", {
         kind: "error",
       });

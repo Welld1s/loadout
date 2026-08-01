@@ -25,6 +25,7 @@ import type {
 import {
   createCollection,
   deleteCollection,
+  editCollectionApps,
   listCollections,
   readSteamLibrary,
   renameCollection,
@@ -56,6 +57,22 @@ const STEAM_READ_TIMEOUT_MS = 8000;
 const GAME_LIBRARY_SERVICE = "__core:game-library";
 const PLAYTIME_PLUGIN = "playtime";
 
+/**
+ * How long the owed sync waits before trying again, per attempt. Backs off
+ * because the thing it is waiting for — Steam finishing its library load —
+ * takes seconds on a warm boot and can take a minute on a cold one, and gives
+ * up after the last entry rather than retrying for the session's lifetime.
+ */
+const OWED_RETRY_DELAYS_MS: readonly number[] = [5_000, 20_000, 60_000];
+
+/**
+ * The sync refused because the library read came back empty or degraded.
+ *
+ * A distinct type rather than a message match, so the owed-sync retry can wait
+ * out a hydrating Steam without also retrying failures that waiting cannot
+ * fix — Steam closed, the config read-only, a write rejected.
+ */
+class LibraryNotLoadedError extends Error {}
 
 /** What a sync did to one collection, for reporting it back. */
 export interface SyncChange {
@@ -126,6 +143,10 @@ export default class CollectionsBackend implements PluginBackend {
    * the user's edit from memory and from disk.
    */
   private configChain: Promise<unknown> = Promise.resolve();
+  /** The pending owed-sync retry, so unloading cancels it. */
+  private owedRetry: ReturnType<typeof setTimeout> | undefined;
+  /** Overridden in tests, which cannot wait out a real boot's worth of delay. */
+  private owedRetryDelays: readonly number[] = OWED_RETRY_DELAYS_MS;
 
   async onLoad(): Promise<void> {
     const result = await loadConfig();
@@ -140,15 +161,51 @@ export default class CollectionsBackend implements PluginBackend {
     if (this.config.mirror.autoSync && this.config.mirror.pendingSync) {
       // Load is the one automatic sync left, and it is safe here precisely
       // because nothing is on screen waiting for this backend yet.
-      void this.syncMirror().catch((err) => {
-        this.log?.warn(
-          `[collections] Owed sync still can't run: ${err instanceof Error ? err.message : err}`,
-        );
-      });
+      this._runOwedSync();
     }
   }
 
-  async onUnload(): Promise<void> {}
+  async onUnload(): Promise<void> {
+    clearTimeout(this.owedRetry);
+    this.owedRetry = undefined;
+  }
+
+  /**
+   * The owed sync, retried a few times while the library is still arriving.
+   *
+   * Plugin load is the *earliest* Steam could be up, which makes it the moment
+   * the library is least likely to have hydrated — and that is precisely what
+   * `_syncOnce`'s guard refuses on. Without a retry the one automatic sync
+   * left would give up in the first seconds of every boot and wait for the
+   * user to open the plugin.
+   *
+   * Only that one refusal is retried, and only a handful of times. Steam being
+   * *closed* is not a transient we can wait out on a handheld, and a backend
+   * that keeps retrying forever is a backend quietly writing to Steam long
+   * after anyone expected it to.
+   */
+  private _runOwedSync(attempt = 0): void {
+    void this.syncMirror().catch((err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      const delay =
+        err instanceof LibraryNotLoadedError ? this.owedRetryDelays[attempt] : undefined;
+      if (delay === undefined) {
+        this.log?.warn(`[collections] Owed sync still can't run: ${message}`);
+        return;
+      }
+      this.log?.info(`[collections] Owed sync deferred (${message}) — retrying in ${delay}ms`);
+      this.owedRetry = setTimeout(() => {
+        this.owedRetry = undefined;
+        // Somebody may have synced by hand in the meantime, or turned
+        // auto-sync off. Either way this retry is no longer wanted.
+        if (this.config.mirror.autoSync && this.config.mirror.pendingSync) {
+          this._runOwedSync(attempt + 1);
+        }
+      }, delay);
+      // Never a reason to hold the process open.
+      (this.owedRetry as { unref?: () => void }).unref?.();
+    });
+  }
 
   // ── Config ───────────────────────────────────────────────────────────
 
@@ -294,13 +351,13 @@ export default class CollectionsBackend implements PluginBackend {
       return this.config;
     }
 
-    await this._setMirrorState({
-      ...this.config.mirror,
+    await this._setMirrorState((mirror) => ({
+      ...mirror,
       ledger: {
-        ...this.config.mirror.ledger,
-        entries: this.config.mirror.ledger.entries.filter((e) => e.managedId !== id),
+        ...mirror.ledger,
+        entries: mirror.ledger.entries.filter((e) => e.managedId !== id),
       },
-    });
+    }));
     return this.config;
   }
 
@@ -314,11 +371,24 @@ export default class CollectionsBackend implements PluginBackend {
     return run;
   }
 
-  private async _setMirrorState(mirror: CollectionsConfig["mirror"]): Promise<void> {
+  /**
+   * Update the mirror state, deciding what it becomes **inside** the lock.
+   *
+   * It used to take a finished `mirror` object built by the caller. That is
+   * fine when the caller snapshots and enqueues in one synchronous block, and
+   * wrong for `_markSyncOwed`, which captures before its own disk write and
+   * enqueues after it: a sync landing in that gap had its freshly-written
+   * ledger overwritten by the pre-sync copy, orphaning a collection it had
+   * just created in Steam. Taking an updater means the ledger is always the
+   * one on disk right now.
+   */
+  private async _setMirrorState(
+    update: (mirror: CollectionsConfig["mirror"]) => CollectionsConfig["mirror"],
+  ): Promise<void> {
     await this._mutateConfig(async () => {
       // Read inside the lock: a `setConfig` that landed while the sync ran is
       // already applied, and its edits must survive.
-      const next: CollectionsConfig = { ...this.config, mirror };
+      const next: CollectionsConfig = { ...this.config, mirror: update(this.config.mirror) };
       await saveConfig(next);
       this.config = next;
       this._broadcast();
@@ -346,20 +416,11 @@ export default class CollectionsBackend implements PluginBackend {
     // a sync reading it back can miss an edit that has already happened.
     this.editSeq += 1;
     if (after.mirror.pendingSync) return;
-    void this._setMirrorState({ ...after.mirror, pendingSync: true }).catch(() => {});
+    void this._setMirrorState((mirror) => ({ ...mirror, pendingSync: true })).catch(() => {});
   }
 
   // ── The grid ─────────────────────────────────────────────────────────
 
-  /**
-   * Every collection worth showing: the ones this plugin maintains, and the
-   * ones already in Steam.
-   *
-   * Linked collections are read live rather than stored, so a collection made
-   * in EmuDeck five minutes ago appears without the plugin knowing anything
-   * about it. When Steam is unreachable the managed half still renders — a
-   * smaller honest grid beats an error page.
-   */
   /**
    * Read Steam, but never wait on it indefinitely.
    *
@@ -390,6 +451,15 @@ export default class CollectionsBackend implements PluginBackend {
     }
   }
 
+  /**
+   * Every collection worth showing: the ones this plugin maintains, and the
+   * ones already in Steam.
+   *
+   * Linked collections are read live rather than stored, so a collection made
+   * in EmuDeck five minutes ago appears without the plugin knowing anything
+   * about it. When Steam is unreachable the managed half still renders — a
+   * smaller honest grid beats an error page.
+   */
   async listAll(): Promise<{ collections: CollectionSummary[]; steamReachable: boolean }> {
     const snapshot = await this.getSnapshot();
     const evalGames = buildEvalGames(snapshot.games);
@@ -514,14 +584,37 @@ export default class CollectionsBackend implements PluginBackend {
    *
    * Returns how many went, so the UI can report it rather than leaving the
    * user to count. Reads the collection again rather than trusting a list the
-   * UI captured: this writes the *whole* membership, and doing that from a
-   * stale copy is how you lose the entries somebody added in between.
+   * UI captured — that copy is always a moment old, and the ids named here are
+   * the ones about to be deleted. The write itself is a targeted removal
+   * (`editCollectionApps`), so entries added between the read and the write
+   * survive, as do the collection's own unresolvable ids that we did not judge
+   * dead.
    */
   async pruneLinked(id: string): Promise<{ removed: number; kept: number }> {
     this._assertWritable();
+    // A managed collection has no Steam id of its own to prune and can never
+    // hold a dead reference — its membership is recomputed from the library
+    // every time. Nothing in the UI offers this for one, but answering "there
+    // was nothing to do" beats "that collection no longer exists".
+    if (this.config.collections.some((c) => c.id === id)) return { removed: 0, kept: 0 };
+    // **One** library read, used both to decide what is stale and to decide
+    // whether that decision can be trusted. Reading twice — once here, once
+    // inside `listGames` — meant the guard interrogated a healthy snapshot
+    // while the stale list came from a broken one, which is the exact
+    // combination the guard exists to refuse.
     const snapshot = await this.getSnapshot();
-    const { staleAppIds, games } = await this.listGames(id);
-    if (staleAppIds.length === 0) return { removed: 0, kept: 0 };
+    const steamCollections = await this._readSteam((c) => listCollections(c));
+    const found = steamCollections.find((c) => c.id === id);
+    if (!found) throw new Error("That collection no longer exists");
+
+    if (found.isDynamic || !found.isEditable) {
+      throw new Error("Steam works this collection out for itself, so its contents can't be edited here.");
+    }
+
+    const known = new Set(snapshot.games.map((g) => g.appId));
+    const staleAppIds = found.appIds.filter((appId) => !known.has(appId));
+    const live = found.appIds.filter((appId) => known.has(appId));
+    if (staleAppIds.length === 0) return { removed: 0, kept: live.length };
 
     // "Stale" means *the library doesn't know this id* — which is only a safe
     // thing to act on when the library itself is trustworthy. Both sources
@@ -529,27 +622,57 @@ export default class CollectionsBackend implements PluginBackend {
     // EmuDeck collection look dead: 700 entries, none of them in the manifest
     // scan (shortcuts have no appmanifest), all of them "prunable". Confirming
     // that dialog would empty a collection somebody else built.
-    if (snapshot.providers.appstore?.status !== "ok") {
+    // `appstore: "ok"` only means the call returned — Steam answers with an
+    // empty list while its stores are still hydrating, and that reads as a
+    // library where every owned-but-uninstalled game has vanished. Require
+    // evidence the read carried something, not merely that it completed.
+    if (snapshot.providers.appstore?.status !== "ok" || snapshot.games.length === 0) {
       throw new Error(
         "Steam's library isn't fully loaded, so this can't tell a dead entry from an unread one. Try again in a moment.",
       );
     }
+    // A *partly* loaded library is the dangerous one: real Steam games present
+    // so the check above passes, non-Steam shortcuts absent so every ROM in an
+    // EmuDeck collection reads dead. If the ids being dropped are
+    // shortcut-shaped, the snapshot has to show it knows about shortcuts at
+    // all before we act on that.
+    //
+    // What this cannot do is tell that apart from a library that genuinely has
+    // no shortcuts — somebody who removed EmuDeck and kept the collection. Two
+    // independent sources feed `source: "shortcut"` (the on-disk
+    // `shortcuts.vdf` scan and Steam's own `type-shortcut`/`type-rom` sets),
+    // so both would have to be wrong at once for the guard to fire on a real
+    // library; but when it does fire, refusing is still the right way round —
+    // the ids are inert either way, and pruning them is the only irreversible
+    // move available. So the message says what is true and what to do, rather
+    // than promising that waiting will fix it. It said "yet" and "in a
+    // moment", which for that user is never.
+    const looksLikeShortcut = (appId: string) => Number(appId) > 2 ** 31;
+    if (
+      staleAppIds.some(looksLikeShortcut) &&
+      !snapshot.games.some((g) => g.source === "shortcut")
+    ) {
+      throw new Error(
+        "Most of what looks dead here is a non-Steam shortcut, and your library lists none at all — " +
+          "so this can't tell entries left behind by a removed shortcut from a shortcut list that " +
+          "didn't load. If Steam is still starting up, try again once it has. If you removed those " +
+          "shortcuts for good, the collection itself is what to delete.",
+      );
+    }
     // Everything unknown and nothing known is what a broken read looks like,
     // not what a collection with some dead shortcuts looks like.
-    if (games.length === 0) {
+    if (live.length === 0) {
       throw new Error(
         "Every entry in this collection looks unreadable, which usually means the library is still loading rather than that they are all dead.",
       );
     }
 
-    const steamCollections = await this._readSteam((c) => listCollections(c));
-    const found = steamCollections.find((c) => c.id === id);
-    if (!found) throw new Error("That collection no longer exists");
-
-    const stale = new Set(staleAppIds);
-    const keep = found.appIds.filter((appId) => !stale.has(appId));
-    await withSteamClient((c) => setCollectionApps(c, { collectionId: id, appIds: keep }));
-    return { removed: found.appIds.length - keep.length, kept: keep.length };
+    // A targeted removal, not a rewrite: the ids being dropped are precisely
+    // the ones just judged dead, and nothing else in the collection is named.
+    await withSteamClient((c) =>
+      editCollectionApps(c, { collectionId: id, remove: staleAppIds }),
+    );
+    return { removed: staleAppIds.length, kept: live.length };
   }
 
   /**
@@ -564,7 +687,10 @@ export default class CollectionsBackend implements PluginBackend {
    * degraded, writing it back truncated the collection to whatever the UI
    * happened to be showing.
    *
-   * Re-reading here means the only thing that changes is what was asked for.
+   * The delta goes all the way down: `editCollectionApps` names the ids to add
+   * and remove rather than handing Steam a membership to converge on, so an
+   * entry EmuDeck adds between our read and Steam's evaluate survives — and so
+   * do the unresolvable ids the UI never saw.
    */
   async editLinked(
     id: string,
@@ -573,17 +699,10 @@ export default class CollectionsBackend implements PluginBackend {
     this._assertWritable();
     if (add.length === 0 && remove.length === 0) throw new Error("Nothing to change");
 
-    const steamCollections = await this._readSteam((c) => listCollections(c));
-    const found = steamCollections.find((c) => c.id === id);
-    if (!found) throw new Error("That collection no longer exists");
-
-    const dropped = new Set(remove);
-    const kept = found.appIds.filter((appId) => !dropped.has(appId));
-    const present = new Set(kept);
-    const appIds = [...kept, ...add.filter((appId) => !present.has(appId))];
-
-    await withSteamClient((c) => setCollectionApps(c, { collectionId: id, appIds }));
-    return { count: appIds.length };
+    const info = await withSteamClient((c) =>
+      editCollectionApps(c, { collectionId: id, add, remove }),
+    );
+    return { count: info.appIds.length };
   }
 
   async renameLinked(id: string, name: string): Promise<void> {
@@ -664,7 +783,7 @@ export default class CollectionsBackend implements PluginBackend {
     summary: string;
     labels: Record<string, string>;
   }> {
-    const plan = await this._buildMirrorPlan();
+    const { plan } = await this._buildMirrorPlan(await this.getSnapshot());
     return {
       plan,
       summary: summarizePlan(plan),
@@ -690,14 +809,32 @@ export default class CollectionsBackend implements PluginBackend {
     this._assertWritable();
     const editsBefore = this.editSeq;
 
+    // Both library sources degrade to empty on failure, and a sync rewrites
+    // whole memberships across every mirrored collection at once — so a
+    // half-loaded library doesn't produce a smaller sync, it produces one that
+    // empties every collection we own. `pruneLinked` refuses on the same
+    // signal for a far more targeted write; this is the path that needed it
+    // most, and the automatic owed-sync at load fires at exactly the moment
+    // Steam is least likely to have finished hydrating.
+    const snapshot = await this.getSnapshot();
+    if (snapshot.providers.appstore?.status !== "ok" || snapshot.games.length === 0) {
+      await this._rememberPendingSync();
+      throw new LibraryNotLoadedError(
+        "Steam's library isn't loaded yet, so syncing now would empty your collections. It stays owed and will run once the library is there.",
+      );
+    }
+
     let plan: MirrorPlan;
     let result: MirrorSyncResult;
     try {
-      plan = await this._buildMirrorPlan();
+      // The guarded snapshot, not a fresh one: the check above is only worth
+      // anything if it inspected the very reading these memberships come from.
+      const built = await this._buildMirrorPlan(snapshot);
+      plan = built.plan;
       result = await withSteamClient(async (client) =>
         applyMirrorPlan({
           plan,
-          ledger: this.config.mirror.ledger,
+          ledger: built.ledger,
           ops: mirrorOps(client),
           now: Date.now(),
         }),
@@ -709,8 +846,8 @@ export default class CollectionsBackend implements PluginBackend {
       throw err;
     }
 
-    await this._setMirrorState({
-      ...this.config.mirror,
+    await this._setMirrorState((mirror) => ({
+      ...mirror,
       ledger: result.ledger,
       // Only clear the flag when everything landed. Steam dying *after* the
       // session connects makes each write fail individually, which the
@@ -721,7 +858,7 @@ export default class CollectionsBackend implements PluginBackend {
       // record it as synced and leave Steam quietly wrong until something
       // unrelated triggered another sync.
       pendingSync: result.failures.length > 0 || this.editSeq !== editsBefore,
-    });
+    }));
 
     const { created, updated, renamed, deleted, failures } = result;
     if (failures.length > 0) {
@@ -750,7 +887,7 @@ export default class CollectionsBackend implements PluginBackend {
       renamed,
       deleted,
       failures,
-      changes: await this._describeChanges(plan),
+      changes: this._describeChanges(plan, snapshot),
       blocked,
     };
   }
@@ -762,16 +899,21 @@ export default class CollectionsBackend implements PluginBackend {
    * away. Surfacing them is the whole answer to "why did that game disappear":
    * a rules-driven collection dropping a game is correct, and only feels
    * arbitrary when it happens in silence.
+   *
+   * Named from the sync's own snapshot rather than a fresh read: a third
+   * reading of the library costs another `getGames` plus another CDP round
+   * trip on a handheld, and a name resolved from a *different* reading is how
+   * "3 removed" comes back as three bare app ids.
    */
-  private async _describeChanges(plan: MirrorPlan): Promise<SyncChange[]> {
+  private _describeChanges(plan: MirrorPlan, snapshot: GameMetadataSnapshot): SyncChange[] {
     const label = new Map(this.config.collections.map((c) => [c.id, c.label] as const));
     const changes: SyncChange[] = [];
 
-    // Only resolve names if something actually moved — this is a full library
-    // read, and most syncs are no-ops.
+    // Still only built when something actually moved: most syncs are no-ops,
+    // and this is a map over the whole library.
     const needsNames = plan.updates.some((u) => u.add.length + u.remove.length > 0);
     const nameOf = needsNames
-      ? new Map((await this.getSnapshot()).games.map((g) => [g.appId, g.name] as const))
+      ? new Map(snapshot.games.map((g) => [g.appId, g.name] as const))
       : new Map<string, string>();
     const names = (ids: readonly string[]) =>
       ids.slice(0, 5).map((id) => nameOf.get(id) ?? id);
@@ -813,21 +955,19 @@ export default class CollectionsBackend implements PluginBackend {
   private async _rememberPendingSync(): Promise<void> {
     if (this.config.mirror.pendingSync) return;
     try {
-      await this._setMirrorState({ ...this.config.mirror, pendingSync: true });
+      await this._setMirrorState((mirror) => ({ ...mirror, pendingSync: true }));
     } catch {
       // The original failure is the one worth reporting.
     }
   }
 
   /**
-   * Evaluate every managed collection and diff against Steam.
+   * The plan, built against **one** reading of the config and **one** reading
+   * of the library.
    *
-   * Uses the same `evaluateCollection` the webview renders from — a second
-   * implementation here is how a collection comes to mean one thing on screen
-   * and another in Steam.
-   */
-  /**
-   * The plan, built against **one** reading of the config.
+   * Evaluates with the same `evaluateCollection` the webview renders from — a
+   * second implementation here is how a collection comes to mean one thing on
+   * screen and another in Steam.
    *
    * `this.config` used to be read twice here — once to evaluate, once to plan
    * — with two awaits in between, and this backend keeps serving RPCs across
@@ -837,9 +977,17 @@ export default class CollectionsBackend implements PluginBackend {
    * time we plan is no longer skipped, so the whole library gets written into
    * Steam under it. That is exactly the accident the `unbuilt` guard exists to
    * prevent, arriving through the back door.
+   *
+   * The library snapshot is passed **in** for the same reason, one level up:
+   * `getSnapshot` is uncached, so fetching our own here meant the caller's
+   * degraded-library guard interrogated one reading while memberships were
+   * computed from another. A `getGames` failure or a CDP timeout between the
+   * two emptied every mirrored collection with the guard reporting nothing —
+   * the same two-reads mistake `pruneLinked` had.
    */
-  private async _buildMirrorPlan(): Promise<MirrorPlan> {
-    const snapshot = await this.getSnapshot();
+  private async _buildMirrorPlan(
+    snapshot: GameMetadataSnapshot,
+  ): Promise<{ plan: MirrorPlan; ledger: CollectionsConfig["mirror"]["ledger"] }> {
     const evalGames = buildEvalGames(snapshot.games);
     const now = Date.now();
 
@@ -850,18 +998,35 @@ export default class CollectionsBackend implements PluginBackend {
     const namePrefix = this.config.settings.namePrefix;
 
     const evaluated = new Map<string, string[]>();
+    // Collections whose rules this build cannot answer. An unresolvable fact
+    // evaluates to `indeterminate`, which the default policy counts as a
+    // match, so the collection matches everything — the planner refuses those
+    // rather than writing a copy of the library into Steam.
+    const unevaluable = new Set<string>();
     for (const c of collections) {
-      evaluated.set(
-        c.id,
-        evaluateCollection(c, evalGames, { now }).matched.map((g) => g.appId),
-      );
+      const result = evaluateCollection(c, evalGames, { now });
+      evaluated.set(c.id, result.matched.map((g) => g.appId));
+      // Only under a policy that turns `indeterminate` into a match. Under
+      // `"fail"` an unchecked rule matches *nothing*, so the collection is
+      // narrower than intended rather than wider — and refusing it there would
+      // contradict `diagnoseCollection`, which offers "exclude games we
+      // couldn't check" as the fix for exactly this and would then leave the
+      // user applying a fix that doesn't unblock the sync.
+      if (result.blockedFacts.length > 0 && c.indeterminatePolicy !== "fail") {
+        unevaluable.add(c.id);
+      }
     }
 
     const steamCollections: SteamCollectionInfo[] = await withSteamClient((client) =>
       listCollections(client),
     );
 
-    return planMirror({ collections, evaluated, ledger, steamCollections, namePrefix });
+    // The ledger travels with the plan. Applying against a second, later read
+    // meant `applyToLedger` patched a ledger the plan was never built from.
+    return {
+      plan: planMirror({ collections, evaluated, ledger, steamCollections, namePrefix, unevaluable }),
+      ledger,
+    };
   }
 
   // ── Internals ────────────────────────────────────────────────────────

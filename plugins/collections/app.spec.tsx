@@ -3,6 +3,7 @@ import * as actualUi from "@loadout/ui";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { LIBRARY } from "./test/fixtures/library";
 import { defaultConfig, validateConfig } from "./lib/config";
+import { appStoreProviders, phase1Providers } from "./lib/adapt";
 
 const calls: Array<{ method: string; args: unknown[] }> = [];
 let mirrorState = { autoSync: false, pendingSync: false };
@@ -14,8 +15,19 @@ let mirrorState = { autoSync: false, pendingSync: false };
  */
 let releaseListGames: (() => void) | null = null;
 let holdListGames = false;
+/**
+ * Make `editLinked` reject — but only when released, so the rollback can be
+ * made to land *after* the user has moved to another collection. Rejecting
+ * immediately resolves the race before it exists.
+ */
+let failEditLinked = false;
+let rejectEditLinked: (() => void) | null = null;
 let summaries: unknown[] = [];
 let steamReachable = true;
+/** The library read comes back empty, as it does while Steam hydrates. */
+let libraryDegraded = false;
+/** Make the *next* `getConfig` reject, once. */
+let failNextGetConfig = false;
 let games: string[] = [];
 let managedCollections: unknown[] = [];
 
@@ -41,8 +53,26 @@ const callMock = mock((method: string, ...args: unknown[]) => {
       // A real library, not an empty one: the preset gallery greys out any
       // preset whose data source is missing, so with no games every preset
       // would be unpickable.
-      return Promise.resolve({ games: LIBRARY, providers: {}, generatedAt: 0 });
+      //
+      // Providers come from the real helpers rather than a hand-written `{}`.
+      // That field is how the UI tells "the library is loaded" from "the call
+      // returned" — `getSnapshot` never rejects, since both its sources
+      // degrade to empty — so a fake that omitted it described a snapshot the
+      // backend cannot produce, and every screen under test believed a
+      // library it should have been waiting for.
+      return Promise.resolve(
+        libraryDegraded
+          ? { games: [], providers: phase1Providers(false), generatedAt: 0 }
+          : { games: LIBRARY, providers: appStoreProviders(true), generatedAt: 0 },
+      );
     case "getConfig":
+      // Fails once, on demand: the config and the library are fetched by the
+      // same effect, and a config that threw used to take the library's answer
+      // down with it and never be asked for again.
+      if (failNextGetConfig) {
+        failNextGetConfig = false;
+        return Promise.reject(new Error("config read failed (test stub)"));
+      }
       // A *whole* config, built from the real default. It used to be
       // `{collections, mirror}` alone — a shape the real `setConfig` rejects
       // outright ("settings are missing", "collectionOrder must be a list of
@@ -75,9 +105,17 @@ const callMock = mock((method: string, ...args: unknown[]) => {
       });
     case "setCollections":
       return Promise.resolve({ collections: managedCollections });
+    case "editLinked":
+      if (!failEditLinked) return Promise.resolve({ count: 0 });
+      return new Promise((_resolve, reject) => {
+        rejectEditLinked = () => reject(new Error("Steam went away (test stub)"));
+      });
     case "listGames": {
+      // Per-collection, so a response landing in the wrong collection is
+      // visible rather than coincidentally identical.
+      const forId = String((args as string[])[0] ?? "");
       const answer = {
-        games: games.map((appId) => ({ appId, name: `Game ${appId}` })),
+        games: games.map((appId) => ({ appId, name: `${forId} game ${appId}` })),
         kind: "linked",
         staleAppIds: [],
       };
@@ -139,8 +177,12 @@ beforeEach(() => {
   mirrorState = { autoSync: false, pendingSync: false };
   releaseListGames = null;
   holdListGames = false;
+  failEditLinked = false;
+  rejectEditLinked = null;
   summaries = [];
   steamReachable = true;
+  libraryDegraded = false;
+  failNextGetConfig = false;
   games = [];
   managedCollections = [];
   container = document.createElement("div");
@@ -221,6 +263,68 @@ describe("opening a collection", () => {
 describe("editing a collection's rules", () => {
   /** A managed collection with the shape the rule builder needs. */
   const managed = fullCollection;
+
+  it("won't price the presets against a library that hasn't loaded", async () => {
+    // `getSnapshot` never rejects — both its sources degrade to empty — so a
+    // Steam still hydrating answers with a well-formed snapshot of nothing.
+    // Deciding on `snapshot !== null` treats that as a loaded library, and the
+    // page then greys out every preset blaming the user's play history for an
+    // outage of ours. The backend refuses to sync or prune on this same
+    // signal; the UI has to read it the same way.
+    libraryDegraded = true;
+    ({ unmount } = renderApp());
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "New collection" })).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "New collection" }));
+    await waitFor(() => expect(screen.getByText("Or start from a preset")).toBeTruthy());
+
+    expect(screen.getByText(/Reading your library/)).toBeTruthy();
+    expect(screen.queryByText(/Needs play history/)).toBeNull();
+  });
+
+  it("asks again rather than settling for the empty answer", async () => {
+    // One fetch would leave every screen priced against that empty snapshot
+    // for the rest of the session, and nothing else re-reads the library.
+    libraryDegraded = true;
+    ({ unmount } = renderApp());
+    await waitFor(() => expect(calls.some((c) => c.method === "getSnapshot")).toBe(true));
+
+    libraryDegraded = false;
+    await waitFor(
+      () => expect(calls.filter((c) => c.method === "getSnapshot").length).toBeGreaterThan(1),
+      { timeout: 4000 },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "New collection" }));
+    await waitFor(() => expect(screen.queryByText(/Reading your library/)).toBeNull());
+  }, 10_000);
+
+  it("asks for the config again when its first read fails", async () => {
+    // The config and the library are fetched by the same effect. They shared a
+    // `Promise.all`, so a config that threw discarded a library that had
+    // arrived perfectly well — and once the library gained a retry, the config
+    // was left outside it and never asked for again, leaving the rules screen
+    // on a spinner for the rest of the session.
+    managedCollections = [managed("backlog", "Backlog")];
+    summaries = [
+      summary({ id: "backlog", label: "Backlog", kind: "managed", autoMaintained: true }),
+    ];
+    failNextGetConfig = true;
+    ({ unmount } = renderApp());
+
+    await waitFor(
+      () => expect(calls.filter((c) => c.method === "getConfig").length).toBeGreaterThan(1),
+      { timeout: 4000 },
+    );
+    // And the rules screen has what it needs, rather than the spinner it shows
+    // when `collections` never arrived.
+    await waitFor(() => expect(screen.getByText("Backlog")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: /Backlog/ }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Options" })).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "Options" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toBeTruthy());
+  }, 10_000);
 
   it("locks the gallery while a preset is being built", async () => {
     // Creating one takes a beat, and a press that shows no sign of having
@@ -335,6 +439,38 @@ describe("editing a collection's rules", () => {
     expect(screen.queryByRole("button", { name: "Save" })).toBeNull();
   });
 
+  it("doesn't paint one collection's games under another's header", async () => {
+    // Every edit path writes `games` after an await. Without a request token a
+    // rollback lands in whichever collection is open by then — and the edit
+    // paths write against what is on screen, so the next removal would aim at
+    // the wrong collection's members.
+    summaries = [summary(), summary({ id: "srm-2", label: "Nintendo 64" })];
+    games = ["10", "20"];
+    failEditLinked = true;
+    ({ unmount } = renderApp());
+    await waitFor(() => expect(screen.getByText("Sega Genesis")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: /Sega Genesis/ }));
+    await waitFor(() => expect(screen.getByText("srm-1 game 10")).toBeTruthy());
+
+    // Start a removal, then leave for the other collection before it fails.
+    fireEvent.click(screen.getByRole("button", { name: "Edit collection" }));
+    fireEvent.click(screen.getByText("srm-1 game 10"));
+    fireEvent.click(screen.getByText(/Remove 1 from collection/));
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    await waitFor(() => expect(screen.getByText("Nintendo 64")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: /Nintendo 64/ }));
+
+    await waitFor(() => expect(screen.getByText("srm-2 game 10")).toBeTruthy());
+
+    // Only now does the earlier edit fail. Its rollback belongs to the
+    // collection we left, and must not land in this one.
+    rejectEditLinked?.();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.queryByText("srm-1 game 10")).toBeNull();
+    expect(screen.getByText("srm-2 game 10")).toBeTruthy();
+  });
+
   it("won't offer adding until it knows what is already in the collection", async () => {
     // Adding against a list that hadn't arrived wrote only what was picked, so
     // a 713-entry ROM collection came back holding one game.
@@ -406,8 +542,10 @@ describe("editing a collection's rules", () => {
     fireEvent.click(screen.getByRole("button", { name: /Sega Genesis/ }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Remove collection" })).toBeTruthy());
 
+    // Arm, then confirm on the *renamed* button: the two used to share a name
+    // and a slot, so a double-press deleted.
     fireEvent.click(screen.getByRole("button", { name: "Remove collection" }));
-    fireEvent.click(screen.getByRole("button", { name: "Remove collection" }));
+    fireEvent.click(screen.getByText(/Delete .*Sega Genesis/));
 
     await waitFor(() => expect(screen.queryByText("Sega Genesis")).toBeNull());
     // Back on the grid, with everything else still there.
@@ -444,12 +582,14 @@ describe("editing a collection's rules", () => {
     fireEvent.click(screen.getByRole("button", { name: /Sega Genesis/ }));
     await waitFor(() => expect(screen.getByRole("button", { name: "Remove collection" })).toBeTruthy());
 
-    // The bin spells out what it would do rather than doing it: an icon cannot
-    // name the collection it is about to destroy.
+    // The bin spells out what it would do rather than doing it — and the
+    // confirmation is a differently named button in a different place, so
+    // pressing twice in the same spot cannot delete.
     fireEvent.click(screen.getByRole("button", { name: "Remove collection" }));
     expect(calls.some((c) => c.method === "deleteLinked")).toBe(false);
+    expect(screen.queryByRole("button", { name: "Remove collection" })).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: "Remove collection" }));
+    fireEvent.click(screen.getByText(/Delete .*Sega Genesis/));
     await waitFor(() => expect(calls.some((c) => c.method === "deleteLinked")).toBe(true));
   });
 
