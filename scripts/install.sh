@@ -965,6 +965,24 @@ Description=Loadout Overlay
 After=graphical-session.target
 PartOf=graphical-session.target
 
+# Widen, but do NOT remove, the start limiter. A mode switch has a window
+# with no X server at all, so several starts can fail back to back, and the
+# default 5-in-10s is tight enough to trip during one. Tripping is not fatal
+# — with UpheldBy= above systemd logs "not starting since we tried this too
+# often recently" and does keep retrying — but it stalls recovery for no
+# reason. Measured on the no-X-yet shape: ~12 starts/min, RestartSec-paced,
+# comfortably inside this 20/min budget.
+#
+# The limiter still has to exist, because `UpheldBy=` above re-queues a start
+# the instant the unit goes inactive and those starts are NOT paced by
+# RestartSec= (that only paces the Restart= path). So if the launcher ever
+# exits cleanly, upholds alone would respawn it as fast as it can exit, with
+# nothing else to throttle it: `Restart=on-failure` does not fire on exit 0,
+# and the ExecStartPre `/up` wait only blocks while the backend is down.
+# 20-in-60s absorbs any plausible mode switch while still capping a runaway.
+StartLimitIntervalSec=60
+StartLimitBurst=20
+
 [Service]
 Type=simple
 
@@ -1078,6 +1096,32 @@ ExecStopPost=-/bin/sh -c 'pkill -CONT -x steam || true'
 
 [Install]
 WantedBy=graphical-session.target
+
+# Recovery net for a session switch that doesn't cycle the target.
+# `PartOf=` stops us when graphical-session.target goes down and
+# `WantedBy=` starts us again when it comes back UP — but on a SteamOS
+# Gaming -> Desktop switch those two never pair up. The target's own stop
+# job gets refused as destructive:
+#
+#   Transaction for graphical-session.target/stop is destructive
+#   (xdg-desktop-portal.service has 'start' job queued)
+#
+# so the target stays active while `PartOf=` has already stopped us, it
+# never "starts" again, and nothing brings us back — the overlay stays
+# dead until the next reboot or a manual `systemctl --user start`.
+# `UpheldBy=` closes exactly that gap: while the target is active, systemd
+# restarts us whenever we aren't running, whether or not it ever cycled.
+#
+# This is an [Install] directive, so it only takes effect on enable — it
+# writes the graphical-session.target.upholds/ symlink. install.sh runs
+# `reenable` rather than `enable` for that reason: plain `enable` is a
+# no-op for an already-enabled unit, so upgraders would silently never
+# get the symlink. In [Unit] it parses as an unknown key and is ignored.
+#
+# Trade-off worth knowing when debugging: this also reverts a manual
+# `systemctl --user stop` within seconds. To hold it down, mask it
+# (`systemctl --user mask --now loadout-overlay`) and unmask after.
+UpheldBy=graphical-session.target
 OVERLAYEOF
         success "Overlay service file written to $OVERLAY_SERVICE_FILE"
 
@@ -1088,7 +1132,7 @@ OVERLAYEOF
         # before the user-facing summary — leaving a confusing half-install.
         # The unit file is on disk regardless, so it'll be picked up on the
         # next graphical login even if we couldn't reload/enable now.
-        if systemctl --user daemon-reload 2>/dev/null && systemctl --user enable loadout-overlay 2>/dev/null; then
+        if systemctl --user daemon-reload 2>/dev/null && systemctl --user reenable loadout-overlay 2>/dev/null; then
             success "Overlay service enabled (starts with graphical session)"
         else
             warn "Couldn't enable the overlay user service now (no active user session?)."
