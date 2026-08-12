@@ -37,7 +37,7 @@ import {
   onOverlayToggleKeyboard,
   onOverlayScroll,
   onOverlayVisibility,
-  getOverlayVisibility,
+  tryGetOverlayVisibility,
   type OverlayAction,
 } from "./lib/electrobun";
 import { setKeyboardVisible, isKeyboardVisible } from "@loadout/ui";
@@ -185,18 +185,77 @@ async function boot() {
   // keyboard events and plays select sounds while the user is back in
   // the game, because gamescope's minimize doesn't flip document.hidden.
   function dispatchVisibility(isOpen: boolean): void {
+    // Same root cause as the polling stop above, one layer down: because
+    // minimize never flips document.hidden, Chromium does not treat the
+    // page as hidden and so never throttles the renderer. The focus ring
+    // is `focusPulse 2s ease-in-out infinite`, and spatial-nav always
+    // leaves something focused, so there is permanently one running
+    // animation and the compositor repaints at the display's refresh rate
+    // forever — including while the overlay is closed and off-screen.
+    //
+    // Measured on an ONEXPLAYER APEX (120Hz), overlay CLOSED and idle:
+    // 20.3% of a core with the animation running, 3.4% with animations
+    // paused. That is a constant battery cost on a handheld for a ring
+    // nobody can see. Park them whenever the window is hidden.
+    document.documentElement.classList.toggle("loadout-idle", !isOpen);
     window.dispatchEvent(
       new CustomEvent("loadout:overlay-visibility", {
         detail: { isOpen },
       }),
     );
   }
-  getOverlayVisibility()
-    .then(dispatchVisibility)
+  // The window is created hidden at boot (see the BrowserWindow comment in
+  // src/bun/index.ts), so start parked rather than waiting to be told —
+  // otherwise a slow or dropped initial fetch leaves the renderer
+  // unthrottled for the whole session, which is the case this is all meant
+  // to fix. Erring toward parked is the deliberate bias: burning a core
+  // forever is worse than a ring that is briefly static.
+  //
+  // Unconditional is safe only because `tryGetOverlayVisibility()` answers
+  // a definite `true` outside Electrobun. This file IS reachable in a plain
+  // browser — `webview:dev` runs vite rooted at src/webview — and there
+  // nothing ever pushes a visibility message, so a `null` there would leave
+  // the class on and freeze the dev UI at `opacity: 0`.
+  document.documentElement.classList.add("loadout-idle");
+
+  // Two paths deliver open/close, and they race. `onOverlayVisibility`
+  // registers against a synchronous global and is live almost immediately;
+  // the initial fetch has to resolve an RPC handle first. So a pushed
+  // transition can — and on the boot-time open paths does — arrive BEFORE
+  // the fetch resolves, and the fetch's now-stale value must not overwrite
+  // it.
+  //
+  // Landing a stale `false` while the window is on screen is worse than a
+  // frozen focus ring: `viewEnter`/`fadeIn` are one-shot entry animations
+  // with no fill-mode, so pausing them at t=0 pins `opacity: 0` on whatever
+  // just mounted — App.tsx's view container and the whole plugin surface in
+  // PluginHost.tsx. The overlay would render blank, and stale-false also
+  // stops gamepad polling, so it would be unresponsive too.
+  //
+  // `tryGetOverlayVisibility` rather than `getOverlayVisibility`: the latter
+  // fail-opens to `true` when the static RPC handle isn't attached yet,
+  // which at boot is *always* — measured on-device, it undid the class 0ms
+  // after it was set and left the renderer unthrottled until the first
+  // manual close. A `null` here means "couldn't tell", and the right
+  // response is to keep the parked default rather than assume open.
+  //
+  // There is no retry and no timeout shorter than the 30s maxRequestTime.
+  // A dropped request therefore parks us until the next real transition,
+  // which is the intended bias — but see the PR notes: combined with a
+  // push lost before the listener below registers, it is the one path that
+  // can leave a visible overlay parked, and it self-heals on next toggle.
+  let visibilityPushed = false;
+  tryGetOverlayVisibility()
+    .then((isOpen) => {
+      if (isOpen !== null && !visibilityPushed) dispatchVisibility(isOpen);
+    })
     .catch((err) =>
-      console.warn("[main] getOverlayVisibility failed:", err),
+      console.warn("[main] tryGetOverlayVisibility failed:", err),
     );
-  onOverlayVisibility(dispatchVisibility);
+  onOverlayVisibility((isOpen) => {
+    visibilityPushed = true;
+    dispatchVisibility(isOpen);
+  });
 
   // Bun-side ControllerShortcuts → OpenPlugin lands here. Route straight
   // into the App's hash-based router; the webview is persistent so the
