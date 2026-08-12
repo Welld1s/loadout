@@ -8,6 +8,18 @@ The format is loosely based on [Keep a Changelog](https://keepachangelog.com).
 
 ---
 
+## [v0.8.1] — 2026-08-12
+
+### Fixed
+- **The overlay starts again after a SteamOS update** (#247) — A SteamOS update moved three system libraries to new major versions, and the overlay stopped opening entirely: it crash-looped every five seconds on a library it could no longer find. Loadout itself kept running the whole time — fan curves, TDP, wake fixes — so the only symptom was the overlay never appearing, with nothing on screen to say why. The overlay ships its own copy of the libraries SteamOS doesn't include, and the step that decides which ones to bundle was matching them by filename rather than by the name programs actually ask for. That left it quietly depending on whichever versions SteamOS happened to ship that day, so an OS update broke it — and it also let an outdated copy of one library override the newer one SteamOS provides, which broke the overlay a second way as soon as the first was fixed.
+- **A fresh install on SteamOS no longer arrives broken** (#247) — Same root cause, but it did not need an OS update to bite: for anyone who installed since late June, one library was left as a broken shortcut pointing at nothing, and the overlay never opened at all. Reinstalling did not help and neither did older versions, because the fault was in the install step rather than in any released build.
+- **The overlay comes back when you switch between Gaming and Desktop Mode** (#247) — Switching modes stopped the overlay and then never restarted it, so it stayed dead until a reboot. It is meant to work in both. The mode switch tears down the session the overlay is tied to, but on SteamOS that teardown does not always complete, and the overlay was only ever restarted by a teardown that did — so it fell into the gap and nothing brought it back.
+- **The overlay no longer burns a CPU core while it is closed** (#248) — With the overlay shut and off-screen it still used about a fifth of a CPU core, continuously, on a battery-powered handheld. The highlight around the selected item is a looping animation, something is always selected, and the overlay's window never reports itself as hidden the way a normal background tab does — so the display kept redrawing that highlight at up to 120 times a second, forever, for a ring nobody could see. Animations now stop while the window is hidden. Measured on an OneXPlayer APEX: 20.3% of a core before, 3.7% after.
+- **Update confirmations no longer land while the overlay is hidden** (#248) — The "update finished" toast could be shown and dismissed against a hidden window, so you would never see it.
+
+### Upgrade notes
+- **If your overlay does not open on SteamOS, re-run the installer rather than updating from inside the app.** Both install-time fixes above live in the step that assembles the overlay's libraries, which only runs during installation — the in-app updater cannot deliver them, and if the overlay will not open you cannot reach it anyway. The one-line installer in the README is the fix; your settings, plugins and profiles are untouched.
+
 ## [v0.8.0] — 2026-08-02
 
 ### Added
