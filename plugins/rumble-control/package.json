@@ -1,0 +1,26 @@
+{
+  "name": "@loadout/plugin-rumble-control",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Rumble (vibration) control for handhelds via InputPlumber",
+  "dependencies": {
+    "react": "^18.3.0",
+    "react-icons": "^5.6.0",
+    "@loadout/ui": "workspace:*",
+    "@loadout/types": "workspace:*",
+    "@loadout/exec": "workspace:*",
+    "@loadout/plugin-storage": "workspace:*"
+  },
+  "plugin": {
+    "id": "rumble-control",
+    "name": "Rumble Control",
+    "description": "Control vibration intensity and motors on your handheld",
+    "permissions": {
+      "commands": ["busctl"],
+      "network": [],
+      "filesystem": []
+    },
+    "category": "Device",
+    "subtitle": "Vibration intensity & motors"
+  }
+}
